@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <link rel="preconnect" href="https://fonts.gstatic.com/" crossorigin />
+    <link rel="stylesheet" as="style" href="https://fonts.googleapis.com/css2?display=swap&amp;family=Noto+Sans%3Awght%40400%3B500%3B700&amp;family=Space+Grotesk%3Awght%40400%3B500%3B700" onload="this.rel='stylesheet'" />
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined" rel="stylesheet" />
+    <title>Lichess Game Viewer</title>
+    <link rel="icon" type="image/x-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48' fill='%233b82f6'%3E%3Cpath clip-rule='evenodd' d='M12.0799 24L4 19.2479L9.95537 8.75216L18.04 13.4961L18.0446 4H29.9554L29.96 13.4961L38.0446 8.75216L44 19.2479L35.92 24L44 28.7521L38.0446 39.2479L29.96 34.5039L29.9554 44H18.0446L18.04 34.5039L9.95537 39.2479L4 28.7521L12.0799 24Z' fill-rule='evenodd'%3E%3C/path%3E%3C/svg%3E" />
+    <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+    <style>
+        .loader { border-top-color: #3b82f6; animation: spin 1s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body class="bg-slate-900 text-slate-200 antialiased">
+    <div class="relative flex size-full min-h-screen flex-col" style='font-family: "Space Grotesk", "Noto Sans", sans-serif;'>
+        <div class="flex h-full grow flex-col">
+            <header class="flex items-center justify-between whitespace-nowrap border-b border-solid border-slate-800 px-4 sm:px-10 py-4">
+                <div class="flex items-center gap-4">
+                    <svg class="size-8 text-blue-500" fill="none" viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg"><path clip-rule="evenodd" d="M12.0799 24L4 19.2479L9.95537 8.75216L18.04 13.4961L18.0446 4H29.9554L29.96 13.4961L38.0446 8.75216L44 19.2479L35.92 24L44 28.7521L38.0446 39.2479L29.96 34.5039L29.9554 44H18.0446L18.04 34.5039L9.95537 39.2479L4 28.7521L12.0799 24Z" fill="currentColor" fill-rule="evenodd"></path></svg>
+                    <h1 class="text-xl font-bold leading-tight tracking-[-0.015em] text-slate-100">Lichess Game Viewer</h1>
+                </div>
+            </header>
+            <main class="px-4 sm:px-10 md:px-20 lg:px-40 flex flex-1 justify-center py-8 sm:py-12">
+                <div class="flex flex-col w-full max-w-4xl flex-1 gap-10">
+                    <div>
+                        <h2 class="text-4xl sm:text-5xl font-bold tracking-tighter text-slate-50 mb-4">Find and Analyze Games</h2>
+                        <p class="text-lg text-slate-400">Enter a Lichess username to fetch and display their 10 most recent games.</p>
+                    </div>
+
+                    <form action="{{ url_for('index') }}" method="POST" id="search-form">
+                        <div class="relative flex items-center">
+                            <span class="material-symbols-outlined absolute left-4 text-slate-500"> search </span>
+                            <input name="username" class="form-input w-full rounded-lg border-2 border-slate-700 bg-slate-800/50 h-14 pl-12 pr-32 text-base font-normal leading-normal placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-colors" placeholder="e.g. DrNykterstein" value="{{ username or '' }}" />
+                            <button type="submit" class="absolute right-2 top-1/2 -translate-y-1/2 bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-5 rounded-md h-10 flex items-center justify-center transition-all duration-200 ease-in-out disabled:opacity-50 disabled:cursor-wait">
+                                <span id="search-button-text">Search</span>
+                                <div id="loader" class="loader ease-linear rounded-full border-4 border-t-4 border-gray-200 h-6 w-6 hidden"></div>
+                            </button>
+                        </div>
+                    </form>
+                    
+                    {% if error %}
+                    <div class="bg-red-900/50 border border-red-700 text-red-300 px-4 py-3 rounded-lg flex items-center gap-3" role="alert">
+                        <span class="material-symbols-outlined">error</span>
+                        <span>{{ error }}</span>
+                    </div>
+                    {% endif %}
+
+                    <section>
+                        <div class="overflow-hidden rounded-lg border border-slate-800 bg-slate-900/70 shadow-lg">
+                            <table class="w-full">
+                                <thead class="bg-slate-800/50">
+                                    <tr>
+                                        <th class="px-6 py-4 text-left text-xs font-medium uppercase tracking-wider text-slate-400">Players</th>
+                                        <th class="px-6 py-4 text-left text-xs font-medium uppercase tracking-wider text-slate-400 hidden sm:table-cell">Result</th>
+                                        <th class="px-6 py-4 text-left text-xs font-medium uppercase tracking-wider text-slate-400 hidden md:table-cell">Date</th>
+                                        <th class="px-6 py-4 text-left text-xs font-medium uppercase tracking-wider text-slate-400"></th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-slate-800">
+                                    {% if games %}
+                                        {% for game in games %}
+                                        <tr class="hover:bg-slate-800/60 transition-colors duration-150">
+                                            <td class="px-6 py-4 whitespace-nowrap">
+                                                <div class="text-sm font-medium text-slate-200">{{ game.white_player }}</div>
+                                                <div class="text-sm text-slate-400">vs {{ game.black_player }}</div>
+                                            </td>
+                                            <td class="px-6 py-4 whitespace-nowrap text-sm text-slate-300 hidden sm:table-cell">{{ game.result }}</td>
+                                            <td class="px-6 py-4 whitespace-nowrap text-sm text-slate-400 hidden md:table-cell">{{ game.date }}</td>
+                                            <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                                                <a class="bg-slate-700/80 hover:bg-slate-700 text-slate-200 font-semibold py-2 px-4 rounded-md transition-colors" href="{{ url_for('view_game', game_id=game.id) }}">View</a>
+                                            </td>
+                                        </tr>
+                                        {% endfor %}
+                                    {% else %}
+                                        <tr>
+                                            <td colspan="4" class="px-6 py-8 text-center text-slate-500">
+                                                {% if not username %}
+                                                    No games to display. Enter a Lichess username above to begin.
+                                                {% else %}
+                                                    No recent games found for this user.
+                                                {% endif %}
+                                            </td>
+                                        </tr>
+                                    {% endif %}
+                                </tbody>
+                            </table>
+                        </div>
+                    </section>
+                </div>
+            </main>
+        </div>
+    </div>
+    <script>
+        // **UX IMPROVEMENT**: Shows a loading indicator on form submission for better user feedback.
+        document.getElementById('search-form').addEventListener('submit', function() {
+            const username = this.querySelector('input[name="username"]').value;
+            if (username.trim()) {
+                document.getElementById('search-button-text').classList.add('hidden');
+                const loader = document.getElementById('loader');
+                loader.classList.remove('hidden');
+                loader.classList.add('inline-block');
+                this.querySelector('button[type="submit"]').disabled = true;
+            }
+        });
+    </script>
+</body>
+</html>
