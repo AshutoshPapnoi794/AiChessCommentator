@@ -33,40 +33,20 @@
         .move-active { @apply bg-accent-active text-white; }
         .loader { border-top-color: #58A6FF; animation: spin 1s linear infinite; }
         @keyframes spin { to { transform: rotate(360deg); } }
-
-        /* The arrow container and the board are siblings, inside a relative parent */
         #arrow-container {
-            position: absolute;
-            top: 0; left: 0; right: 0; bottom: 0;
-            overflow: hidden;
-            pointer-events: none;
-            z-index: 10;
+            position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+            overflow: hidden; pointer-events: none; z-index: 10;
         }
-        .arrow-wrapper {
-            position: absolute;
-            transform-origin: 0 50%;
-        }
+        .arrow-wrapper { position: absolute; transform-origin: 0 50%; }
         .arrow-shaft {
-            position: absolute;
-            left: 0;
-            top: 50%;
-            height: 14%;
-            width: 100%;
+            position: absolute; left: 0; top: 50%; height: 14%; width: 100%;
             background-image: linear-gradient(to right, rgba(20, 80, 220, 0.85), rgba(40, 120, 255, 0.75));
-            transform: translateY(-50%);
-            border-radius: 999px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.5);
+            transform: translateY(-50%); border-radius: 999px; box-shadow: 0 1px 3px rgba(0,0,0,0.5);
         }
         .arrow-head {
-            position: absolute;
-            right: 0;
-            top: 50%;
-            width: 45%;
-            height: 50%;
+            position: absolute; right: 0; top: 50%; width: 45%; height: 50%;
             background-image: linear-gradient(to right, rgba(20, 80, 220, 0.85), rgba(40, 120, 255, 0.75));
-            clip-path: polygon(0% 0%, 100% 50%, 0% 100%);
-            transform: translateY(-50%);
-            box-shadow: 1px 1px 3px rgba(0,0,0,0.5);
+            clip-path: polygon(0% 0%, 100% 50%, 0% 100%); transform: translateY(-50%); box-shadow: 1px 1px 3px rgba(0,0,0,0.5);
         }
     </style>
 </head>
@@ -77,89 +57,84 @@
                 <span class="material-symbols-outlined text-3xl text-accent">castle</span>
                 <h1 class="text-xl font-bold text-text-primary">Lichess Game Viewer</h1>
             </a>
+            {% if game.stockfish_enabled %}
+            <div id="header-accuracy-container" class="flex items-center gap-4 text-sm">
+                <div id="header-accuracy-loading" class="flex items-center gap-2 text-text-secondary">
+                    <div class="loader ease-linear rounded-full border-2 border-t-2 border-gray-500 h-4 w-4"></div>
+                    <span class="hidden md:inline">Calculating Accuracy...</span>
+                </div>
+                <div id="header-accuracy-results" class="hidden items-center gap-4">
+                     <div class="flex items-center gap-2" title="White's Accuracy">
+                         <span class="w-3 h-3 rounded-full bg-white block border border-black/20"></span>
+                         <span id="accuracy-white" class="font-mono font-bold text-base">--%</span>
+                     </div>
+                     <div class="flex items-center gap-2" title="Black's Accuracy">
+                         <span class="w-3 h-3 rounded-full bg-gray-400 block border border-black/20"></span>
+                         <span id="accuracy-black" class="font-mono font-bold text-base">--%</span>
+                     </div>
+                </div>
+            </div>
+            {% endif %}
         </header>
         <main class="flex-grow container mx-auto p-4 lg:p-6 min-h-0">
             <div class="grid grid-cols-1 lg:grid-cols-[320px_1fr_320px] gap-6 h-full">
                 
-                <div class="bg-secondary rounded-lg p-4 flex flex-col order-2 lg:order-1 min-h-0 border border-border-primary space-y-6">
-                    <div>
-                        <h3 class="text-base font-bold text-text-primary mb-3 flex items-center gap-2">
-                            <span class="material-symbols-outlined text-accent text-xl">smart_toy</span>AI Commentator
-                        </h3>
-                        <div class="bg-tertiary p-3 rounded-md">
-                            <p id="ai-commentary" class="text-sm text-text-secondary italic">"Placeholder for AI commentary."</p>
-                        </div>
-                    </div>
+                <div class="bg-secondary rounded-lg flex flex-col order-2 lg:order-1 min-h-0 border border-border-primary overflow-hidden">
+                    <div class="overflow-y-auto p-4">
+                        <div class="space-y-6">
+                            <div>
+                                <h3 class="text-base font-bold text-text-primary mb-3 flex items-center gap-2">
+                                    <span class="material-symbols-outlined text-accent text-xl">smart_toy</span>AI Commentator
+                                </h3>
+                                <div class="bg-tertiary rounded-md min-h-[120px] p-4 border-l-4 border-accent/80">
+                                    <p id="ai-commentary" class="text-base text-text-primary/90 leading-relaxed">
+                                        Navigate through the moves to get live AI commentary on the position.
+                                    </p>
+                                </div>
+                            </div>
 
-                    {% if game.stockfish_enabled %}
-                    <div>
-                        <h3 class="text-base font-bold text-text-primary mb-3 flex items-center gap-2">
-                            <span class="material-symbols-outlined text-accent text-xl">accuracy</span>Game Accuracy
-                        </h3>
-                        <div id="accuracy-container" class="space-y-3 bg-tertiary p-3 rounded-md min-h-[92px] flex items-center justify-center">
-                            <div id="accuracy-loading" class="text-center text-xs text-text-secondary">
-                                <div class="loader ease-linear rounded-full border-4 border-t-4 border-gray-500 h-6 w-6 mx-auto mb-2"></div>
-                                Calculating...
-                            </div>
-                            <div id="accuracy-results" class="hidden w-full">
-                                <div class="flex items-center justify-between text-sm">
-                                    <span class="font-bold text-white">White</span>
-                                    <span id="accuracy-white" class="font-mono font-bold">--%</span>
-                                </div>
-                                <div class="w-full h-2 bg-secondary rounded-full overflow-hidden mt-1">
-                                    <div id="accuracy-bar-white" class="h-full bg-white transition-all duration-500" style="width: 0%;"></div>
-                                </div>
-                                <div class="flex items-center justify-between text-sm mt-3">
-                                    <span class="font-bold text-white">Black</span>
-                                    <span id="accuracy-black" class="font-mono font-bold">--%</span>
-                                </div>
-                                <div class="w-full h-2 bg-secondary rounded-full overflow-hidden mt-1">
-                                    <div id="accuracy-bar-black" class="h-full bg-gray-400 transition-all duration-500" style="width: 0%;"></div>
+                            {% if game.stockfish_enabled %}
+                            <div id="accuracy-panel" class="hidden"></div>
+                            <div>
+                                <h3 class="text-base font-bold text-text-primary mb-3 flex items-center gap-2">
+                                    <span class="material-symbols-outlined text-accent text-xl">model_training</span>Top Engine Lines
+                                    <div class="ml-auto flex items-center gap-2">
+                                        <span id="analysis-loader" class="hidden loader ease-linear rounded-full border-2 border-t-2 border-gray-500 h-4 w-4"></span>
+                                        <span id="evaluation-score" class="font-mono font-bold text-lg text-text-primary">0.00</span>
+                                    </div>
+                                    <button id="stockfish-settings-btn" class="ml-1 p-1.5 rounded-full text-text-secondary hover:bg-tertiary hover:text-white transition-colors">
+                                        <span class="material-symbols-outlined text-xl">settings</span>
+                                    </button>
+                                </h3>
+                                <div id="top-lines-display" class="space-y-2 text-sm bg-tertiary p-3 rounded-md min-h-[88px] flex items-center justify-center">
+                                    <p class="text-xs text-text-secondary">Navigate moves to start analysis</p>
                                 </div>
                             </div>
+                            {% else %}
+                            <div class="bg-tertiary/50 border border-border-primary text-text-secondary px-4 py-3 rounded-lg flex flex-col items-center text-center gap-2" role="alert">
+                                <span class="material-symbols-outlined">power_off</span>
+                                <span class="font-semibold">Engine Analysis Unavailable</span>
+                                <p class="text-xs">The server has not been configured with the Stockfish chess engine.</p>
+                            </div>
+                            {% endif %}
                         </div>
                     </div>
-                    <div>
-                        <h3 class="text-base font-bold text-text-primary mb-3 flex items-center gap-2">
-                            <span class="material-symbols-outlined text-accent text-xl">model_training</span>Top Engine Lines
-                            <div class="ml-auto flex items-center gap-2">
-                                <span id="analysis-loader" class="hidden loader ease-linear rounded-full border-2 border-t-2 border-gray-500 h-4 w-4"></span>
-                                <span id="evaluation-score" class="font-mono font-bold text-lg text-text-primary">0.00</span>
-                            </div>
-                            <button id="stockfish-settings-btn" class="ml-1 p-1.5 rounded-full text-text-secondary hover:bg-tertiary hover:text-white transition-colors">
-                                <span class="material-symbols-outlined text-xl">settings</span>
-                            </button>
-                        </h3>
-                        <div id="top-lines-display" class="space-y-2 text-sm bg-tertiary p-3 rounded-md min-h-[88px] flex items-center justify-center">
-                            <p class="text-xs text-text-secondary">Navigate moves to start analysis</p>
-                        </div>
-                    </div>
-                    {% else %}
-                    <div class="bg-tertiary/50 border border-border-primary text-text-secondary px-4 py-3 rounded-lg flex flex-col items-center text-center gap-2" role="alert">
-                        <span class="material-symbols-outlined">power_off</span>
-                        <span class="font-semibold">Engine Analysis Unavailable</span>
-                        <p class="text-xs">The server has not been configured with the Stockfish chess engine.</p>
-                    </div>
-                    {% endif %}
                 </div>
-
+                
                 <div class="order-1 lg:order-2 grid grid-rows-[auto_1fr_auto] h-full min-h-0 gap-y-2">
                     <div class="flex-shrink-0 w-full flex justify-between items-center py-1 px-1">
                         <p class="font-semibold text-base truncate text-text-primary">{{ game.black.name }} ({{ game.black.rating }})</p>
                         <p id="black-clock-display" class="font-mono text-lg bg-secondary px-3 py-1 rounded-md border border-border-primary"></p>
                     </div>
-                    
                     <div class="relative min-w-0 min-h-0 flex justify-center items-stretch gap-3">
                         <div id="vertical-eval-bar" class="w-3 bg-tertiary rounded-full overflow-hidden flex flex-col-reverse">
                            <div id="evaluation-bar-white" class="w-full bg-white transition-all duration-300 ease-out" style="height: 50%;"></div>
                         </div>
                         <div id="board-container" class="relative min-w-0 min-h-0 flex-grow h-full flex justify-center items-center">
                             <div id="board"></div>
-                            <!-- *** CRITICAL CHANGE: The arrow container is a SIBLING of the board *** -->
                             <div id="arrow-container"></div>
                         </div>
                     </div>
-                    
                     <div class="flex-shrink-0 w-full flex justify-between items-center py-1 px-1">
                         <p class="font-semibold text-base truncate text-text-primary">{{ game.white.name }} ({{ game.white.rating }})</p>
                         <p id="white-clock-display" class="font-mono text-lg bg-text-primary text-primary px-3 py-1 rounded-md"></p>
@@ -179,7 +154,6 @@
         </main>
     </div>
 
-    <!-- Stockfish Settings Modal -->
     <div id="settings-modal" class="fixed inset-0 bg-black/60 z-50 hidden items-center justify-center p-4">
         <div class="bg-secondary rounded-lg shadow-xl w-full max-w-md border border-border-primary">
             <div class="p-6 border-b border-border-primary">

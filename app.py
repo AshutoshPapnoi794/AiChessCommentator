@@ -1,3 +1,5 @@
+# --- START OF FILE app.py ---
+
 import os
 import re
 import io
@@ -6,6 +8,9 @@ import threading
 import math
 import queue
 from typing import List, Optional, Dict
+import base64
+import mimetypes
+import struct
 
 import requests
 import chess
@@ -13,6 +18,14 @@ import chess.pgn
 from flask import Flask, render_template, request, abort
 from flask_socketio import SocketIO
 from stockfish import Stockfish
+from dotenv import load_dotenv
+
+# --- CORRECTED GEMINI IMPORTS ---
+import google.generativeai as genai_text_model  # For the text model
+from google import genai as genai_tts_client     # For the TTS Client
+from google.genai import types                   # Shared types
+
+load_dotenv()
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'a_very_secret_key')
@@ -40,7 +53,34 @@ elif not os.access(STOCKFISH_PATH, os.X_OK):
         STOCKFISH_PATH, STOCKFISH_PATH
     )
     STOCKFISH_PATH = None
-# --- END STOCKFISH SETUP ---
+
+# --- GEMINI SETUP WITH TWO KEYS ---
+GEMINI_TEXT_API_KEY = os.getenv('GEMINI_TEXT_API_KEY')
+GEMINI_TTS_API_KEY = os.getenv('GEMINI_TTS_API_KEY')
+
+text_model = None
+tts_client = None
+
+if not GEMINI_TEXT_API_KEY:
+    logging.warning("GEMINI_TEXT_API_KEY not found. Text AI features will be disabled.")
+else:
+    try:
+        genai_text_model.configure(api_key=GEMINI_TEXT_API_KEY)
+        text_model = genai_text_model.GenerativeModel('gemini-1.5-flash')
+        logging.info("Gemini text model configured successfully.")
+    except Exception as e:
+        logging.error("Failed to configure Gemini text model: %s", e, exc_info=True)
+        text_model = None
+
+if not GEMINI_TTS_API_KEY:
+    logging.warning("GEMINI_TTS_API_KEY not found. Audio AI features will be disabled.")
+else:
+    try:
+        tts_client = genai_tts_client.Client(api_key=GEMINI_TTS_API_KEY)
+        logging.info("Gemini TTS client configured successfully.")
+    except Exception as e:
+        logging.error("Failed to configure Gemini TTS client: %s", e, exc_info=True)
+        tts_client = None
 
 # --- CONSTANTS AND GLOBALS ---
 LICHESS_API_URL = "https://lichess.org/api"
@@ -56,6 +96,37 @@ REQUEST_TIMEOUT = (5, 20)
 GAME_CACHE: Dict[str, str] = {}
 analysis_queues: Dict[str, queue.Queue] = {}
 worker_threads: Dict[str, threading.Thread] = {}
+
+# --- TTS HELPER FUNCTIONS ---
+def convert_to_wav(audio_data: bytes, mime_type: str) -> bytes:
+    parameters = parse_audio_mime_type(mime_type)
+    bits_per_sample = parameters["bits_per_sample"]
+    sample_rate = parameters["rate"]
+    num_channels = 1
+    data_size = len(audio_data)
+    bytes_per_sample = bits_per_sample // 8
+    block_align = num_channels * bytes_per_sample
+    byte_rate = sample_rate * block_align
+    chunk_size = 36 + data_size
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF", chunk_size, b"WAVE", b"fmt ", 16, 1, num_channels,
+        sample_rate, byte_rate, block_align, bits_per_sample, b"data", data_size
+    )
+    return header + audio_data
+
+def parse_audio_mime_type(mime_type: str) -> dict[str, int | None]:
+    bits_per_sample, rate = 16, 24000
+    parts = mime_type.split(";")
+    for param in parts:
+        param = param.strip()
+        if param.lower().startswith("rate="):
+            try: rate = int(param.split("=", 1)[1])
+            except (ValueError, IndexError): pass
+        elif param.startswith("audio/L"):
+            try: bits_per_sample = int(param.split("L", 1)[1])
+            except (ValueError, IndexError): pass
+    return {"bits_per_sample": bits_per_sample, "rate": rate}
 
 # --- HELPER FUNCTIONS and ROUTE HANDLERS ---
 def validate_username(username: str) -> bool: return bool(USERNAME_RE.match(username))
@@ -203,7 +274,7 @@ def analysis_worker(sid: str, q: queue.Queue):
     stockfish.quit()
     logger.info("Stopped analysis worker for sid: %s", sid)
 
-# --- REWRITTEN SOCKETIO HANDLERS ---
+# --- SOCKETIO HANDLERS ---
 @socketio.on('connect')
 def handle_connect():
     sid = request.sid
@@ -242,29 +313,23 @@ def get_cp_value(evaluation: dict) -> int:
 def full_game_analysis_threaded(sid: str, fens: List[str]):
     try:
         stockfish = Stockfish(path=STOCKFISH_PATH, depth=14, parameters={"Threads": 1, "Hash": 64})
-        white_accuracies = []
-        black_accuracies = []
+        white_accuracies, black_accuracies = [], []
         for i in range(len(fens) - 1):
-            fen_before_move = fens[i]
-            fen_after_human_move = fens[i+1]
-            stockfish.set_fen_position(fen_before_move)
-            best_move_uci = stockfish.get_best_move()
-            if not best_move_uci: continue
-            board = chess.Board(fen_before_move)
-            board.push_uci(best_move_uci)
-            fen_after_best_move = board.fen()
-            stockfish.set_fen_position(fen_after_best_move)
-            eval_after_best_move = stockfish.get_evaluation()
-            cp_best_move = get_cp_value(eval_after_best_move)
-            stockfish.set_fen_position(fen_after_human_move)
-            eval_after_human_move = stockfish.get_evaluation()
-            cp_your_move = get_cp_value(eval_after_human_move)
-            cp_diff = cp_best_move - cp_your_move
-            move_accuracy = 100 * math.exp(-0.000025 * (cp_diff ** 2))
-            if (i + 1) % 2 != 0:
-                white_accuracies.append(move_accuracy)
-            else:
-                black_accuracies.append(move_accuracy)
+            stockfish.set_fen_position(fens[i])
+            eval_before = stockfish.get_evaluation()
+            cp_before = get_cp_value(eval_before)
+            stockfish.set_fen_position(fens[i+1])
+            eval_after = stockfish.get_evaluation()
+            cp_after = get_cp_value(eval_after)
+            is_white_move = chess.Board(fens[i]).turn == chess.WHITE
+            cp_loss = (cp_before - cp_after) if is_white_move else (cp_after - cp_before)
+            clamped_loss = max(0, cp_loss)
+            move_accuracy = 103 * math.exp(-0.004 * clamped_loss) - 3
+            move_accuracy = max(0, min(100, move_accuracy))
+
+            if is_white_move: white_accuracies.append(move_accuracy)
+            else: black_accuracies.append(move_accuracy)
+
         accuracy_white = round(sum(white_accuracies) / len(white_accuracies)) if white_accuracies else 100
         accuracy_black = round(sum(black_accuracies) / len(black_accuracies)) if black_accuracies else 100
         socketio.emit('full_analysis_complete', {'white': accuracy_white, 'black': accuracy_black}, room=sid)
@@ -272,8 +337,7 @@ def full_game_analysis_threaded(sid: str, fens: List[str]):
         logger.error("Full game analysis failed for sid %s: %s", sid, e, exc_info=True)
         socketio.emit('analysis_error', {'message': 'Could not calculate accuracy.'}, room=sid)
     finally:
-        if 'stockfish' in locals():
-            stockfish.quit()
+        pass
 
 @socketio.on('request_full_analysis')
 def handle_full_analysis_request(data):
@@ -283,6 +347,107 @@ def handle_full_analysis_request(data):
     thread = threading.Thread(target=full_game_analysis_threaded, args=(sid, fens))
     thread.daemon = True
     thread.start()
+
+# --- AI COMMENTARY HANDLER ---
+def format_evaluation(evaluation: dict) -> str:
+    if evaluation['type'] == 'cp': return f"{'+' if evaluation['value'] > 0 else ''}{evaluation['value']/100.0:.2f}"
+    if evaluation['type'] == 'mate': return f"Mate in {abs(evaluation['value'])}"
+    return "N/A"
+
+@socketio.on('get_ai_commentary')
+def handle_ai_commentary_request(data):
+    sid = request.sid
+    
+    if not text_model:
+        socketio.emit('ai_commentary_text_result', {
+            'commentary': 'AI text commentator is not available (server-side configuration error).'
+        }, room=sid)
+        return
+
+    try:
+        ply = data.get('ply', 0)
+        pgn = data.get('pgn', '')
+        human_move = data.get('humanMove', 'N/A')
+        engine_best_move = data.get('engineBestMove', 'N/A')
+        evaluation = format_evaluation(data.get('evaluation', {}))
+        top_lines = data.get('topLines', [])
+        
+        top_lines_str = "\n".join([
+            f"- {line['san']} (Eval: {format_evaluation({'type': 'cp', 'value': line.get('cp', 0)}) if line.get('mate') is None else format_evaluation({'type': 'mate', 'value': line.get('mate')})})"
+            for line in top_lines[:2]
+        ])
+        
+        prompt = f"""
+You are an expert chess commentator. Your goal is to provide insightful, narrative-driven commentary for an audience of club-level players.
+**Guiding Principles:**
+1.  **Game Phase Awareness:** Adjust your commentary based on the phase of the game. Use the move number to guide you.
+    *   **Opening (Moves 1-15):** Be brief and concise. Focus on opening principles: central control, piece development, and king safety. Mention the name of the opening if known. A slightly inaccurate move is just a "quiet," "unusual," or "passive" choice, not a major event.
+    *   **Middlegame (Moves 16-40):** This is where the action is. Focus on strategic plans, tactical opportunities, pawn breaks, attacking weaknesses, and the consequences of major blunders. Your commentary can be more detailed here.
+    *   **Endgame (Moves 41+):** Focus on technical aspects: king activity, pawn structures, passed pawns, and converting advantages. Explain why a position is winning, losing, or drawn.
+2.  **Proportionality:** The length and intensity of your commentary should match the move's impact.
+    *   A quiet, slightly inaccurate opening move gets 1-2 short sentences.
+    *   A game-changing blunder that hangs a queen deserves a more dramatic and detailed explanation.
+3.  **Positive and Narrative Framing:** Tell a story.
+    *   Avoid robotic phrases. Instead of "This is not a blunder," describe the move's character: "A solid developing move," or "A passive choice that hands the initiative to the opponent."
+    *   Focus on the *purpose* behind the moves. What is each player trying to achieve?
+**Game State:**
+- Move Number: {ply // 2 + 1}
+- PGN so far: {pgn}
+- The move just played was: **{human_move}**
+- The engine's evaluation is: **{evaluation}**
+- The engine's preferred move was: **{engine_best_move}**
+- Other top engine lines:
+{top_lines_str}
+**Your Task:**
+Based on your principles and the provided data, generate a brief, expert commentary on the move **{human_move}**. Use Markdown for emphasis: bold moves with `**move**` and italicize key concepts with `*concept*`.
+"""
+        
+        # 1. GENERATE AND EMIT TEXT
+        text_response = text_model.generate_content(prompt)
+        text_commentary = text_response.text
+        
+        socketio.emit('ai_commentary_text_result', {'commentary': text_commentary}, room=sid)
+
+        # 2. GENERATE AND EMIT AUDIO (Only if TTS client is available)
+        if not tts_client:
+            logger.warning("TTS client not configured, skipping audio generation.")
+            return
+
+        tts_model_name = "gemini-2.5-flash-preview-tts"
+        contents = [types.Content(role="user", parts=[types.Part.from_text(text=text_commentary)])]
+        generate_content_config = types.GenerateContentConfig(
+            temperature=0,
+            response_modalities=["audio"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Charon"))
+            ),
+        )
+
+        audio_buffer = io.BytesIO()
+        first_chunk = True
+        mime_type = "audio/L16;rate=24000"
+
+        for chunk in tts_client.models.generate_content_stream(
+            model=tts_model_name, contents=contents, config=generate_content_config
+        ):
+            if not (chunk.candidates and chunk.candidates[0].content and chunk.candidates[0].content.parts): continue
+            
+            part = chunk.candidates[0].content.parts[0]
+            if part.inline_data and part.inline_data.data:
+                if first_chunk:
+                    mime_type = part.inline_data.mime_type
+                    first_chunk = False
+                audio_buffer.write(part.inline_data.data)
+
+        if audio_buffer.getbuffer().nbytes > 0:
+            wav_data = convert_to_wav(audio_buffer.getvalue(), mime_type)
+            audio_base64 = base64.b64encode(wav_data).decode('utf-8')
+            socketio.emit('ai_commentary_audio_result', {'audio_data': audio_base64}, room=sid)
+
+    except Exception as e:
+        logger.error("Error during AI commentary generation for sid %s: %s", sid, e, exc_info=True)
+        socketio.emit('ai_commentary_error', {'message': 'Failed to generate AI commentary.'}, room=sid)
+
 
 if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=int(os.getenv('PORT', '5000')))

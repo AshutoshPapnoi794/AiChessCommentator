@@ -3,6 +3,12 @@
 $(document).ready(function() {
     let socket = null;
     let analysisRequestCounter = 0;
+    
+    let isAiThinking = false;
+    let lastAiCommentaryPly = -1;
+
+    let currentAudio = null;
+
     let stockfishSettings = {
         depth: 18,
         threads: 4
@@ -14,7 +20,6 @@ $(document).ready(function() {
         $arrowContainer.empty();
     }
 
-    // *** NEW, FOOLPROOF ARROW DRAWING FUNCTION ***
     function drawArrow(from, to) {
         const boardEl = document.getElementById('board');
         const arrowContainerEl = document.getElementById('arrow-container');
@@ -26,12 +31,10 @@ $(document).ready(function() {
         const boardRect = boardEl.getBoundingClientRect();
         if (boardRect.width === 0) return;
 
-        // Use getBoundingClientRect for absolute screen positions
         const arrowContainerRect = arrowContainerEl.getBoundingClientRect();
         const fromRect = fromEl.getBoundingClientRect();
         const toRect = toEl.getBoundingClientRect();
 
-        // Calculate centers relative to the arrow container's top-left corner
         const fromCenter = {
             x: (fromRect.left - arrowContainerRect.left) + (fromRect.width / 2),
             y: (fromRect.top - arrowContainerRect.top) + (fromRect.height / 2),
@@ -82,13 +85,53 @@ $(document).ready(function() {
         }
     }
 
+    function setAiCommentaryLoading(isLoading) {
+        const $commentaryEl = $('#ai-commentary');
+        if (isLoading) {
+            isAiThinking = true;
+            $commentaryEl.html('<span class="italic text-text-secondary">AI is thinking...</span>');
+        } else {
+            isAiThinking = false;
+        }
+    }
+
     if (stockfishEnabled) {
         socket = io();
+
         socket.on('analysis_result', function(data) {
             if (data.requestId !== analysisRequestCounter) { return; }
             setAnalysisLoadingState(false); 
             updateAnalysisUI(data);
+
+            // CRITICAL BUG FIX: Use '===' to ensure the AI is triggered only ONCE at the final depth.
+            const isFinalDepth = data.depth === stockfishSettings.depth;
+
+            if (isFinalDepth && !isAiThinking && currentMoveIndex !== lastAiCommentaryPly) {
+                lastAiCommentaryPly = currentMoveIndex;
+                setAiCommentaryLoading(true);
+
+                let pgn = '';
+                for (let i = 0; i <= currentMoveIndex; i++) {
+                    if (i % 2 === 0) {
+                        pgn += `${Math.floor(i / 2) + 1}. `;
+                    }
+                    pgn += `${history[i].san} `;
+                }
+
+                const commentaryPayload = {
+                    fen: fens[currentMoveIndex + 1],
+                    pgn: pgn.trim(),
+                    ply: currentMoveIndex + 1,
+                    humanMove: history[currentMoveIndex].san,
+                    engineBestMove: data.moves.length > 0 ? data.moves[0].san : 'N/A',
+                    evaluation: data.eval,
+                    topLines: data.moves,
+                };
+
+                socket.emit('get_ai_commentary', commentaryPayload);
+            }
         });
+
         socket.on('analysis_error', function(data) {
             if (data.requestId && data.requestId !== analysisRequestCounter) { return; }
             setAnalysisLoadingState(false);
@@ -96,18 +139,55 @@ $(document).ready(function() {
             console.error('Analysis Error:', data.message);
             $('#top-lines-display').html(`<p class="text-xs text-red-400 font-mono">${data.message}</p>`);
         });
+
+        socket.on('ai_commentary_text_result', function(data) {
+            setAiCommentaryLoading(false);
+            let commentary = data.commentary || 'Received empty commentary from the AI.';
+            
+            commentary = commentary
+                .replace(/\*\*(.*?)\*\*/g, '<strong class="text-white font-semibold">$1</strong>')
+                .replace(/\*(.*?)\*/g, '<em class="italic">$1</em>')
+                .replace(/\n/g, '<br>');
+
+            $('#ai-commentary').html(commentary);
+        });
+        
+        socket.on('ai_commentary_audio_result', function(data) {
+            if (currentAudio) {
+                currentAudio.pause();
+                currentAudio.currentTime = 0;
+            }
+
+            if (data.audio_data) {
+                const audioSrc = 'data:audio/wav;base64,' + data.audio_data;
+                currentAudio = new Audio(audioSrc);
+                currentAudio.play().catch(e => console.error("Audio playback failed:", e));
+            }
+        });
+        
+        socket.on('ai_commentary_error', function(data) {
+            setAiCommentaryLoading(false);
+            $('#ai-commentary').html(`<span class="text-xs text-red-400 font-mono">${data.message}</span>`);
+        });
+
         socket.on('full_analysis_complete', function(data) {
-            $('#accuracy-loading').hide();
-            $('#accuracy-results').removeClass('hidden').addClass('w-full');
+            $('#accuracy-panel').hide();
+            $('#header-accuracy-loading').hide();
+            $('#header-accuracy-results').removeClass('hidden').addClass('flex');
             $('#accuracy-white').text(`${data.white}%`);
-            $('#accuracy-bar-white').css('width', `${data.white}%`);
             $('#accuracy-black').text(`${data.black}%`);
-            $('#accuracy-bar-black').css('width', `${data.black}%`);
         });
     }
 
     function requestAnalysis(fen) {
         if (!socket || !stockfishEnabled) return;
+        
+        if (currentMoveIndex > -1) {
+            $('#ai-commentary').html('<span class="italic text-text-secondary">Waiting for engine analysis...</span>');
+        } else {
+             $('#ai-commentary').html('<span class="italic text-text-secondary">Navigate moves to see AI commentary.</span>');
+        }
+
         const requestId = ++analysisRequestCounter;
         setAnalysisLoadingState(true);
         clearArrows();
@@ -210,8 +290,18 @@ $(document).ready(function() {
     }
     moveListHtml += '</div>';
     moveListContainer.html(moveListHtml);
+    
     function updateState(moveIndex) {
+        if (currentAudio) {
+            currentAudio.pause();
+        }
+        
         currentMoveIndex = moveIndex;
+
+        if (moveIndex !== lastAiCommentaryPly) {
+             lastAiCommentaryPly = -1;
+        }
+
         const newFen = fens[currentMoveIndex + 1];
         board.position(newFen, true);
         $('#white-clock-display').text(formatTime(whiteClockHistory[currentMoveIndex + 1]));
@@ -224,6 +314,7 @@ $(document).ready(function() {
         }
         requestAnalysis(newFen);
     }
+    
     const boardConfig = {
         draggable: false,
         position: startFen || 'start',
@@ -231,6 +322,7 @@ $(document).ready(function() {
         moveSpeed: 200, 
     };
     board = Chessboard('board', boardConfig);
+    
     const boardContainer = document.getElementById('board-container');
     new ResizeObserver(entries => {
         if (!entries || !entries.length) return;
@@ -243,18 +335,20 @@ $(document).ready(function() {
         }
         if (board) {
             board.resize();
-            // Redraw arrow on resize by re-running analysis for current position
             clearArrows();
             const currentFen = fens[currentMoveIndex + 1];
             if (currentFen) requestAnalysis(currentFen);
         }
     }).observe(boardContainer);
+    
     updateState(-1);
+    
     $('#start-btn').on('click', () => updateState(-1));
     $('#end-btn').on('click', () => updateState(history.length - 1));
     $('#prev-btn').on('click', () => { if (currentMoveIndex > -1) updateState(currentMoveIndex - 1); });
     $('#next-btn').on('click', () => { if (currentMoveIndex < history.length - 1) updateState(currentMoveIndex + 1); });
     $('.move-item').on('click', function() { updateState(parseInt($(this).data('move-index'))); });
+    
     $(document).on('keydown', function(e) {
         if ($('input:focus, button:focus').length > 0) return;
         if (e.key === "ArrowLeft") $('#prev-btn').click();
@@ -262,11 +356,13 @@ $(document).ready(function() {
         else if (e.key === "Home") { e.preventDefault(); $('#start-btn').click(); }
         else if (e.key === "End") { e.preventDefault(); $('#end-btn').click(); }
     });
+    
     const $modal = $('#settings-modal');
     const $depthSlider = $('#depth-slider');
     const $threadsSlider = $('#threads-slider');
     const $depthValue = $('#depth-value');
     const $threadsValue = $('#threads-value');
+    
     $('#stockfish-settings-btn').on('click', () => {
         $depthSlider.val(stockfishSettings.depth);
         $threadsSlider.val(stockfishSettings.threads);
@@ -274,13 +370,16 @@ $(document).ready(function() {
         $threadsValue.text(stockfishSettings.threads);
         $modal.removeClass('hidden').addClass('flex');
     });
+    
     function closeModal() {
         $modal.addClass('hidden').removeClass('flex');
     }
+    
     $depthSlider.on('input', () => $depthValue.text($depthSlider.val()));
     $threadsSlider.on('input', () => $threadsValue.text($threadsSlider.val()));
     $('#settings-cancel-btn').on('click', closeModal);
     $modal.on('click', function(e) { if (e.target === this) closeModal(); });
+    
     $('#settings-save-btn').on('click', () => {
         stockfishSettings.depth = parseInt($depthSlider.val());
         stockfishSettings.threads = parseInt($threadsSlider.val());
