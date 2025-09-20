@@ -37,7 +37,6 @@ $(document).ready(function() {
     let currentAudio = null;
     let isAudioEnabled = false; 
 
-    // --- NEW: Caching objects ---
     let moveQualityCache = {};
     let analysisCache = {};
     let commentaryCache = {};
@@ -53,7 +52,7 @@ $(document).ready(function() {
         $arrowContainer.empty();
     }
 
-    function drawArrow(from, to) {
+    function drawArrow(from, to, color = 'engine') { // color can be 'engine' or 'human'
         const boardEl = document.getElementById('board');
         const arrowContainerEl = document.getElementById('arrow-container');
         const fromEl = boardEl.querySelector(`.square-${from}`);
@@ -106,6 +105,9 @@ $(document).ready(function() {
             width: headWidth,
             height: headHeight,
         });
+        
+        // Add a class for specific styling if needed, e.g., for human move arrow color
+        $wrapper.addClass(`arrow-${color}`);
 
         $wrapper.append($shaft, $head);
         $arrowContainer.append($wrapper);
@@ -168,22 +170,34 @@ $(document).ready(function() {
     if (stockfishEnabled) {
         socket = io();
 
-        socket.on('analysis_result', function(data) {
+        socket.on('analysis_result', async function(data) { // Made async for await
             if (data.requestId !== analysisRequestCounter) { return; }
             updateAnalysisUI(data);
 
             const isFinalDepth = data.depth === stockfishSettings.depth;
 
-            // Only cache and request commentary on the final depth result
             if (isFinalDepth) {
                 setAnalysisLoadingState(false);
-                analysisCache[currentMoveIndex] = data; // Store in cache
+                analysisCache[currentMoveIndex] = data;
 
                 if (commentaryCache[currentMoveIndex]) {
                     displayCommentary(commentaryCache[currentMoveIndex]);
                 } else if (!isAiThinking && currentMoveIndex !== lastAiCommentaryPly) {
                     lastAiCommentaryPly = currentMoveIndex;
                     setAiCommentaryLoading(true);
+                    
+                    // --- NEW: Screenshot logic with move arrow ---
+                    const move = history[currentMoveIndex];
+                    const tempBoard = new Chess(fens[currentMoveIndex]);
+                    board.position(tempBoard.fen(), false); // Show board state BEFORE move
+                    drawArrow(move.from, move.to, 'human'); // Draw human move
+                    
+                    const canvas = await html2canvas(document.getElementById('board'));
+                    const imageBase64 = canvas.toDataURL('image/png').split(',')[1];
+                    
+                    board.position(fens[currentMoveIndex + 1], false); // Restore board state to AFTER move
+                    clearArrows(); // Clear human move arrow
+                    drawArrow(data.moves[0].uci.substring(0,2), data.moves[0].uci.substring(2,4)); // Redraw engine arrow
 
                     let pgn = '';
                     for (let i = 0; i <= currentMoveIndex; i++) {
@@ -192,11 +206,12 @@ $(document).ready(function() {
                     }
 
                     const commentaryPayload = {
-                        fen: fens[currentMoveIndex + 1], pgn: pgn.trim(), ply: currentMoveIndex + 1,
-                        humanMove: history[currentMoveIndex].san,
+                        pgn: pgn.trim(), ply: currentMoveIndex + 1,
+                        humanMove: move.san,
                         engineBestMove: data.moves.length > 0 ? data.moves[0].san : 'N/A',
                         evaluation: data.eval, topLines: data.moves,
-                        audio_enabled: isAudioEnabled
+                        audio_enabled: isAudioEnabled,
+                        board_image_base64: imageBase64 // Send the contextual screenshot
                     };
                     socket.emit('get_ai_commentary', commentaryPayload);
                 }
@@ -205,7 +220,7 @@ $(document).ready(function() {
 
         socket.on('move_quality_result', function(data) {
             if (data.classification) {
-                moveQualityCache[currentMoveIndex] = data.classification; // Store in cache
+                moveQualityCache[currentMoveIndex] = data.classification;
                 displayMoveQualityIcon(data.classification, history[currentMoveIndex]);
             }
         });
@@ -220,7 +235,7 @@ $(document).ready(function() {
 
         socket.on('ai_commentary_text_result', function(data) {
             setAiCommentaryLoading(false);
-            commentaryCache[currentMoveIndex] = data.commentary; // Store in cache
+            commentaryCache[currentMoveIndex] = data.commentary;
             displayCommentary(data.commentary);
         });
         
@@ -256,7 +271,6 @@ $(document).ready(function() {
     function requestAnalysis(fen, moveIndex) {
         if (!socket || !stockfishEnabled) return;
 
-        // --- NEW: Check cache before making requests ---
         if (analysisCache[moveIndex]) {
             setAnalysisLoadingState(false);
             updateAnalysisUI(analysisCache[moveIndex]);
@@ -266,10 +280,9 @@ $(document).ready(function() {
             if (moveQualityCache[moveIndex]) {
                 displayMoveQualityIcon(moveQualityCache[moveIndex], history[moveIndex]);
             }
-            return; // Exit if we are using cached data
+            return; 
         }
 
-        // --- Original logic if not cached ---
         if (moveIndex > -1) {
             $('#ai-commentary').html('<span class="italic text-text-secondary">Waiting for engine analysis...</span>');
         } else {
@@ -312,9 +325,7 @@ $(document).ready(function() {
             clearArrows();
             const topMove = data.moves[0];
             if (topMove && topMove.uci) {
-                const from = topMove.uci.substring(0, 2);
-                const to = topMove.uci.substring(2, 4);
-                drawArrow(from, to);
+                drawArrow(topMove.uci.substring(0, 2), topMove.uci.substring(2, 4));
             }
             let linesHtml = `<div class="w-full font-mono text-text-secondary"><div class="text-xs text-right pb-1 border-b border-border-primary/50 mb-1">Depth: ${data.depth}</div>`;
             data.moves.forEach((move, index) => {
@@ -409,6 +420,12 @@ $(document).ready(function() {
             activeMoveEl[0].scrollIntoView({ behavior: 'smooth', block: 'nearest' });
         }
         
+        // --- NEW: Update opening name display ---
+        const openingName = openingNamesByPly[currentMoveIndex + 1];
+        const $openingDisplay = $('#opening-name-display');
+        $openingDisplay.text(openingName || 'Unknown');
+        $openingDisplay.attr('title', openingName || 'Unknown');
+        
         requestAnalysis(newFen, currentMoveIndex);
     }
     
@@ -500,7 +517,6 @@ $(document).ready(function() {
 
         closeModal();
         
-        // If analysis settings changed, clear cache and re-analyze current position
         if (oldDepth !== stockfishSettings.depth) {
             analysisCache = {};
             commentaryCache = {};

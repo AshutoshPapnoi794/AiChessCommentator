@@ -135,10 +135,8 @@
                         <div id="board-container" class="relative min-w-0 min-h-0 flex-grow h-full flex justify-center items-center">
                             <div id="board"></div>
                             <div id="arrow-container"></div>
-                            <!-- NEW OVERLAY to precisely match the board's position and size -->
                             <div id="board-overlay" class="absolute pointer-events-none" style="z-index: 11;">
                                 <div id="move-quality-indicator" class="absolute transition-opacity opacity-0" style="width: 12.5%; height: 12.5%;">
-                                    <!-- Icon is shifted up and right to sit on the corner of the square -->
                                     <img id="move-quality-icon" src="" alt="Move Quality" class="absolute w-5 h-5 sm:w-6 sm:h-6 -top-1 -right-1" />
                                 </div>
                             </div>
@@ -151,7 +149,11 @@
                 </div>
 
                 <div class="bg-secondary rounded-lg p-4 flex flex-col order-3 min-h-0 border border-border-primary">
-                    <div class="text-center mb-2 px-2"><p class="text-xs text-text-secondary uppercase tracking-wider">Opening</p><p class="font-semibold text-text-primary mt-1 truncate" title="{{ game.opening }}">{{ game.opening }}</p></div>
+                    <!-- MODIFIED: Opening display now has an ID for dynamic updates -->
+                    <div class="text-center mb-2 px-2">
+                        <p class="text-xs text-text-secondary uppercase tracking-wider">Opening</p>
+                        <p id="opening-name-display" class="font-semibold text-text-primary mt-1 truncate" title="Starting Position">Starting Position</p>
+                    </div>
                     <div class="border-b border-border-primary my-3"></div>
                     <h2 class="text-lg font-bold mb-3 text-center text-text-primary">Moves</h2>
                     <div id="move-list-container" class="flex-grow overflow-y-auto px-1 -mr-2 pr-2 min-h-0"></div>
@@ -185,7 +187,6 @@
                     </label>
                     <input id="threads-slider" type="range" min="1" max="16" value="4" class="w-full h-2 bg-tertiary rounded-lg appearance-none cursor-pointer accent-accent">
                 </div>
-                <!-- NEW AUDIO TOGGLE -->
                 <div class="border-t border-border-primary pt-6">
                     <h4 class="text-base font-bold text-text-primary mb-2">Commentary Settings</h4>
                     <label for="audio-toggle" class="flex items-center justify-between cursor-pointer">
@@ -206,6 +207,8 @@
 
     <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
     <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <!-- NEW: html2canvas library for taking board screenshots -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
     <script src="{{ url_for('static', filename='lib/chessboard-1.0.0.min.js') }}"></script>
     <script src="{{ url_for('static', filename='lib/chess.js') }}"></script>
     <script>
@@ -213,6 +216,8 @@
         const movesData = {{ game.moves_data|tojson }};
         const initialTimeSeconds = {{ game.initial_time_seconds|tojson }};
         const stockfishEnabled = {{ game.stockfish_enabled|tojson }};
+        // NEW: Pass the list of opening names for each move
+        const openingNamesByPly = {{ game.opening_names_by_ply|tojson }};
     </script>
     <script src="{{ url_for('static', filename='js/game.js') }}"></script>
 </body>

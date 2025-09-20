@@ -12,6 +12,7 @@ import base64
 import mimetypes
 import struct
 from datetime import datetime
+from PIL import Image # <-- NEW IMPORT
 
 import requests
 import chess
@@ -31,6 +32,9 @@ load_dotenv()
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'a_very_secret_key')
 socketio = SocketIO(app)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # --- STOCKFISH SETUP ---
 STOCKFISH_PATH = os.getenv('STOCKFISH_PATH')
@@ -89,14 +93,41 @@ API_HEADERS = {'User-Agent': 'LichessGameViewer/1.0 (https://example.com)'}
 LICHESS_TOKEN = os.getenv('LICHESS_TOKEN')
 if LICHESS_TOKEN:
     API_HEADERS['Authorization'] = f"Bearer {LICHESS_TOKEN}"
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 USERNAME_RE = re.compile(r'^[A-Za-z0-9_.-]{1,50}$')
 GAMEID_RE = re.compile(r'^[A-Za-z0-9_-]+$')
 REQUEST_TIMEOUT = (5, 20)
 GAME_CACHE: Dict[str, str] = {}
 analysis_queues: Dict[str, queue.Queue] = {}
 worker_threads: Dict[str, threading.Thread] = {}
+OPENING_BOOK: Dict[str, str] = {} # <-- NEW: For opening lookup
+
+# --- NEW: OPENING BOOK LOADER ---
+def load_openings():
+    """Loads opening data from TSV files into the global OPENING_BOOK."""
+    global OPENING_BOOK
+    count = 0
+    filenames = ['a.tsv', 'b.tsv', 'c.tsv', 'd.tsv', 'e.tsv']
+    for filename in filenames:
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                for i, line in enumerate(f):
+                    if i == 0 and line.startswith('eco\t'):  # Skip header
+                        continue
+                    parts = line.strip().split('\t')
+                    if len(parts) == 3:
+                        _eco, name, pgn = parts
+                        OPENING_BOOK[pgn.strip()] = name.strip()
+                        count += 1
+        except FileNotFoundError:
+            logger.warning("Opening data file not found: %s. Skipping.", filename)
+        except Exception as e:
+            logger.error("Error reading opening data from %s: %s", filename, e)
+    if count > 0:
+        logger.info("Loaded %d opening positions from TSV files.", count)
+    else:
+        logger.warning("Could not load any opening data. Make sure a.tsv...e.tsv are present.")
+
+load_openings() # <-- NEW: Load data on startup
 
 # --- TTS HELPER FUNCTIONS ---
 def convert_to_wav(audio_data: bytes, mime_type: str) -> bytes:
@@ -263,20 +294,38 @@ def view_game(game_id: str):
     start_fen = headers_map.get('FEN')
     time_control = headers_map.get('TimeControl', '600+0')
     initial_time_seconds = int(time_control.split('+')[0])
+    
+    # --- MODIFIED: Process moves, clocks, and opening names simultaneously ---
     moves_with_clocks = []
+    opening_names_by_ply = ["Starting Position"]
+    last_found_opening = "Starting Position"
+    pgn_string = ""
     board = game.board()
+
     for node in game.mainline():
         move = node.move
+        
+        # Opening lookup logic
+        if board.turn == chess.WHITE:
+            pgn_string += f"{board.fullmove_number}. "
+        pgn_string += board.san(move) + " "
+        lookup_key = pgn_string.strip()
+        if lookup_key in OPENING_BOOK:
+            last_found_opening = OPENING_BOOK[lookup_key]
+        opening_names_by_ply.append(last_found_opening)
+        
+        # Existing move data extraction
         moves_with_clocks.append({ 'san': board.san(move), 'ply': node.ply(), 'clock': node.clock() })
         board.push(move)
+
     game_data = {
         'white': {'name': headers_map.get('White', 'N/A'), 'rating': headers_map.get('WhiteElo', '?')},
         'black': {'name': headers_map.get('Black', 'N/A'), 'rating': headers_map.get('BlackElo', '?')},
-        'opening': headers_map.get('Opening', 'N/A'),
         'start_fen': start_fen,
         'moves_data': moves_with_clocks,
         'initial_time_seconds': initial_time_seconds,
         'stockfish_enabled': STOCKFISH_PATH is not None,
+        'opening_names_by_ply': opening_names_by_ply, # <-- NEW: Pass dynamic opening names
     }
     return render_template('game.html', game=game_data)
 
@@ -326,7 +375,7 @@ def analysis_worker(sid: str, q: queue.Queue):
         except Exception as e:
             logger.error("Error in analysis worker for sid %s: %s", sid, e, exc_info=True)
             socketio.emit('analysis_error', {'message': 'Worker thread encountered an error.'}, room=sid)
-    del stockfish # Use del to quit the engine process
+    del stockfish 
     logger.info("Stopped analysis worker for sid: %s", sid)
 
 # --- SOCKETIO HANDLERS ---
@@ -366,7 +415,6 @@ def get_cp_value(evaluation: dict) -> int:
     return 0
 
 def classify_move(clamped_cp_loss: int, cp_before: int, cp_after: int, is_white_move: bool) -> str:
-    """Classifies a move based on centipawn loss and game state."""
     is_winning_before = cp_before > 200 if is_white_move else cp_before < -200
     is_not_winning_after = -200 <= cp_after <= 200 or \
                            (is_white_move and cp_after < -200) or \
@@ -384,7 +432,6 @@ def classify_move(clamped_cp_loss: int, cp_before: int, cp_after: int, is_white_
 
 @socketio.on('get_move_quality')
 def handle_move_quality_request(data):
-    """Handles real-time, single-move quality classification."""
     sid = request.sid
     fen_before = data.get('fen_before')
     fen_after = data.get('fen_after')
@@ -394,7 +441,6 @@ def handle_move_quality_request(data):
 
     stockfish = None
     try:
-        # Use a shallow depth for quick feedback
         stockfish = Stockfish(path=STOCKFISH_PATH, depth=12, parameters={"Threads": 1, "Hash": 64})
         
         stockfish.set_fen_position(fen_before)
@@ -416,10 +462,9 @@ def handle_move_quality_request(data):
         logger.error("Error during real-time move quality check for sid %s: %s", sid, e)
     finally:
         if stockfish:
-            del stockfish # Use del to quit the engine process
+            del stockfish
 
 def full_game_analysis_threaded(sid: str, fens: List[str]):
-    """Calculates overall accuracy for the entire game."""
     stockfish = None
     try:
         stockfish = Stockfish(path=STOCKFISH_PATH, depth=14, parameters={"Threads": 1, "Hash": 64})
@@ -453,7 +498,7 @@ def full_game_analysis_threaded(sid: str, fens: List[str]):
         socketio.emit('analysis_error', {'message': 'Could not calculate accuracy.'}, room=sid)
     finally:
         if stockfish:
-            del stockfish # Use del to quit the engine process
+            del stockfish
 
 @socketio.on('request_full_analysis')
 def handle_full_analysis_request(data):
@@ -481,13 +526,24 @@ def handle_ai_commentary_request(data):
         return
 
     try:
+        # --- NEW: Process image and prepare multi-modal request ---
+        image_b64 = data.get('board_image_base64')
+        board_image = None
+        if image_b64:
+            try:
+                image_bytes = base64.b64decode(image_b64)
+                board_image = Image.open(io.BytesIO(image_bytes))
+            except Exception as e:
+                logger.warning("Failed to process board image from base64: %s", e)
+
+        # --- Existing data extraction ---
         ply = data.get('ply', 0)
         pgn = data.get('pgn', '')
         human_move = data.get('humanMove', 'N/A')
         engine_best_move = data.get('engineBestMove', 'N/A')
         evaluation = format_evaluation(data.get('evaluation', {}))
         top_lines = data.get('topLines', [])
-        audio_enabled = data.get('audio_enabled', False) # Check for audio flag
+        audio_enabled = data.get('audio_enabled', False)
         
         top_lines_str = "\n".join([
             f"- {line['san']} (Eval: {format_evaluation({'type': 'cp', 'value': line.get('cp', 0)}) if line.get('mate') is None else format_evaluation({'type': 'mate', 'value': line.get('mate')})})"
@@ -496,17 +552,14 @@ def handle_ai_commentary_request(data):
         
         prompt = f"""
 You are an expert chess commentator. Your goal is to provide insightful, narrative-driven commentary for an audience of club-level players.
+Analyze the following board position (image provided) and the move just played.
 **Guiding Principles:**
-1.  **Game Phase Awareness:** Adjust your commentary based on the phase of the game. Use the move number to guide you.
-    *   **Opening (Moves 1-15):** Be brief and concise. Focus on opening principles: central control, piece development, and king safety. Mention the name of the opening if known. A slightly inaccurate move is just a "quiet," "unusual," or "passive" choice, not a major event.
-    *   **Middlegame (Moves 16-40):** This is where the action is. Focus on strategic plans, tactical opportunities, pawn breaks, attacking weaknesses, and the consequences of major blunders. Your commentary can be more detailed here.
-    *   **Endgame (Moves 41+):** Focus on technical aspects: king activity, pawn structures, passed pawns, and converting advantages. Explain why a position is winning, losing, or drawn.
-2.  **Proportionality:** The length and intensity of your commentary should match the move's impact.
-    *   A quiet, slightly inaccurate opening move gets 1-2 short sentences.
-    *   A game-changing blunder that hangs a queen deserves a more dramatic and detailed explanation.
-3.  **Positive and Narrative Framing:** Tell a story.
-    *   Avoid robotic phrases. Instead of "This is not a blunder," describe the move's character: "A solid developing move," or "A passive choice that hands the initiative to the opponent."
-    *   Focus on the *purpose* behind the moves. What is each player trying to achieve?
+1.  **Game Phase Awareness:** Use the move number to determine the game phase.
+    *   **Opening (Moves 1-15):** Be brief. Focus on opening principles. A slightly inaccurate move is just "quiet" or "unusual," not a major event.
+    *   **Middlegame (Moves 16-40):** Focus on strategic plans, tactical opportunities, and blunders.
+    *   **Endgame (Moves 41+):** Focus on technical aspects like king activity and pawn structures.
+2.  **Proportionality:** Match your commentary's intensity to the move's impact. A simple developing move gets one sentence. A game-changing blunder deserves more detail.
+3.  **Positive and Narrative Framing:** Tell a story. Focus on the *purpose* behind moves.
 **Game State:**
 - Move Number: {ply // 2 + 1}
 - PGN so far: {pgn}
@@ -516,11 +569,15 @@ You are an expert chess commentator. Your goal is to provide insightful, narrati
 - Other top engine lines:
 {top_lines_str}
 **Your Task:**
-Based on your principles and the provided data, generate a brief, expert commentary on the move **{human_move}**. Use Markdown for emphasis: bold moves with `**move**` and italicize key concepts with `*concept*`.
+Based on your principles, the text data, and the provided board image, generate a brief, expert commentary on the move **{human_move}**. Use Markdown for emphasis.
 """
         
         # 1. GENERATE AND EMIT TEXT
-        text_response = text_model.generate_content(prompt)
+        request_contents = [prompt]
+        if board_image:
+            request_contents.append(board_image)
+        
+        text_response = text_model.generate_content(request_contents)
         text_commentary = text_response.text
         
         socketio.emit('ai_commentary_text_result', {'commentary': text_commentary}, room=sid)
