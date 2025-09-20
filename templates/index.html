@@ -26,7 +26,7 @@
                 <div class="flex flex-col w-full max-w-4xl flex-1 gap-10">
                     <div>
                         <h2 class="text-4xl sm:text-5xl font-bold tracking-tighter text-slate-50 mb-4">Find and Analyze Games</h2>
-                        <p class="text-lg text-slate-400">Enter a Lichess username to fetch and display their 10 most recent games.</p>
+                        <p class="text-lg text-slate-400">Enter a Lichess username to fetch their most recent games.</p>
                     </div>
 
                     <form action="{{ url_for('index') }}" method="POST" id="search-form">
@@ -78,7 +78,7 @@
                                             <td colspan="4" class="px-6 py-8 text-center text-slate-500">
                                                 {% if not username %}
                                                     No games to display. Enter a Lichess username above to begin.
-                                                {% else %}
+                                                {% elif not error %}
                                                     No recent games found for this user.
                                                 {% endif %}
                                             </td>
@@ -87,13 +87,44 @@
                                 </tbody>
                             </table>
                         </div>
+                        
+                        <!-- PAGINATION CONTROLS -->
+                        {% if games %}
+                        <div class="flex items-center justify-between mt-6">
+                            {% if page > 1 %}
+                                <a href="{{ url_for('index', username=username, page=page-1, since=newest_timestamp) }}" class="flex items-center gap-2 bg-slate-700/80 hover:bg-slate-700 text-slate-200 font-semibold py-2 px-4 rounded-md transition-colors">
+                                    <span class="material-symbols-outlined">arrow_back</span>
+                                    Previous
+                                </a>
+                            {% else %}
+                                <span class="flex items-center gap-2 bg-slate-800 text-slate-600 font-semibold py-2 px-4 rounded-md opacity-50 cursor-not-allowed">
+                                    <span class="material-symbols-outlined">arrow_back</span>
+                                    Previous
+                                </span>
+                            {% endif %}
+                            
+                            <span class="font-mono text-slate-400">Page {{ page }}</span>
+
+                            {% if games_count == 10 %}
+                                <a href="{{ url_for('index', username=username, page=page+1, until=oldest_timestamp) }}" class="flex items-center gap-2 bg-slate-700/80 hover:bg-slate-700 text-slate-200 font-semibold py-2 px-4 rounded-md transition-colors">
+                                    Next
+                                    <span class="material-symbols-outlined">arrow_forward</span>
+                                </a>
+                            {% else %}
+                                <span class="flex items-center gap-2 bg-slate-800 text-slate-600 font-semibold py-2 px-4 rounded-md opacity-50 cursor-not-allowed">
+                                    Next
+                                    <span class="material-symbols-outlined">arrow_forward</span>
+                                </span>
+                            {% endif %}
+                        </div>
+                        {% endif %}
+
                     </section>
                 </div>
             </main>
         </div>
     </div>
     <script>
-        // **UX IMPROVEMENT**: Shows a loading indicator on form submission for better user feedback.
         document.getElementById('search-form').addEventListener('submit', function() {
             const username = this.querySelector('input[name="username"]').value;
             if (username.trim()) {

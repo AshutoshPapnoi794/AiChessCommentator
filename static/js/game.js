@@ -35,6 +35,12 @@ $(document).ready(function() {
     let lastAiCommentaryPly = -1;
 
     let currentAudio = null;
+    let isAudioEnabled = false; 
+
+    // --- NEW: Caching objects ---
+    let moveQualityCache = {};
+    let analysisCache = {};
+    let commentaryCache = {};
 
     let stockfishSettings = {
         depth: 18,
@@ -76,11 +82,10 @@ $(document).ready(function() {
         const length = Math.sqrt(dx * dx + dy * dy);
         const angleRad = Math.atan2(dy, dx);
         
-        // --- THICKER ARROW PROPORTIONS ---
         const squareSize = boardRect.width / 8;
         const headWidth = squareSize * 0.5;
         const headHeight = squareSize * 0.7; 
-        const shaftHeight = squareSize * 0.30; // Increased shaft thickness
+        const shaftHeight = squareSize * 0.30; 
         
         const $wrapper = $('<div>').addClass('arrow-wrapper').css({
             left: fromCenter.x,
@@ -90,7 +95,6 @@ $(document).ready(function() {
             transform: `rotate(${angleRad}rad)`,
         });
 
-        // Shorten the shaft so it doesn't poke through the arrowhead
         const shaftLength = length - (headWidth * 0.8);
 
         const $shaft = $('<div>').addClass('arrow-shaft').css({
@@ -137,7 +141,6 @@ $(document).ready(function() {
         }
 
         const toSquare = move.to;
-        // Assuming white's orientation at the bottom
         const fileIndex = toSquare.charCodeAt(0) - 'a'.charCodeAt(0);
         const rankIndex = 8 - parseInt(toSquare.charAt(1));
 
@@ -154,44 +157,55 @@ $(document).ready(function() {
         $('#move-quality-indicator').addClass('opacity-0');
     }
 
+    function displayCommentary(commentary) {
+        let formattedCommentary = (commentary || 'Could not retrieve commentary.')
+            .replace(/\*\*(.*?)\*\*/g, '<strong class="text-white font-semibold">$1</strong>')
+            .replace(/\*(.*?)\*/g, '<em class="italic">$1</em>')
+            .replace(/\n/g, '<br>');
+        $('#ai-commentary').html(formattedCommentary);
+    }
+
     if (stockfishEnabled) {
         socket = io();
 
         socket.on('analysis_result', function(data) {
             if (data.requestId !== analysisRequestCounter) { return; }
-            setAnalysisLoadingState(false); 
             updateAnalysisUI(data);
 
             const isFinalDepth = data.depth === stockfishSettings.depth;
 
-            if (isFinalDepth && !isAiThinking && currentMoveIndex !== lastAiCommentaryPly) {
-                lastAiCommentaryPly = currentMoveIndex;
-                setAiCommentaryLoading(true);
+            // Only cache and request commentary on the final depth result
+            if (isFinalDepth) {
+                setAnalysisLoadingState(false);
+                analysisCache[currentMoveIndex] = data; // Store in cache
 
-                let pgn = '';
-                for (let i = 0; i <= currentMoveIndex; i++) {
-                    if (i % 2 === 0) {
-                        pgn += `${Math.floor(i / 2) + 1}. `;
+                if (commentaryCache[currentMoveIndex]) {
+                    displayCommentary(commentaryCache[currentMoveIndex]);
+                } else if (!isAiThinking && currentMoveIndex !== lastAiCommentaryPly) {
+                    lastAiCommentaryPly = currentMoveIndex;
+                    setAiCommentaryLoading(true);
+
+                    let pgn = '';
+                    for (let i = 0; i <= currentMoveIndex; i++) {
+                        if (i % 2 === 0) { pgn += `${Math.floor(i / 2) + 1}. `; }
+                        pgn += `${history[i].san} `;
                     }
-                    pgn += `${history[i].san} `;
+
+                    const commentaryPayload = {
+                        fen: fens[currentMoveIndex + 1], pgn: pgn.trim(), ply: currentMoveIndex + 1,
+                        humanMove: history[currentMoveIndex].san,
+                        engineBestMove: data.moves.length > 0 ? data.moves[0].san : 'N/A',
+                        evaluation: data.eval, topLines: data.moves,
+                        audio_enabled: isAudioEnabled
+                    };
+                    socket.emit('get_ai_commentary', commentaryPayload);
                 }
-
-                const commentaryPayload = {
-                    fen: fens[currentMoveIndex + 1],
-                    pgn: pgn.trim(),
-                    ply: currentMoveIndex + 1,
-                    humanMove: history[currentMoveIndex].san,
-                    engineBestMove: data.moves.length > 0 ? data.moves[0].san : 'N/A',
-                    evaluation: data.eval,
-                    topLines: data.moves,
-                };
-
-                socket.emit('get_ai_commentary', commentaryPayload);
             }
         });
 
         socket.on('move_quality_result', function(data) {
             if (data.classification) {
+                moveQualityCache[currentMoveIndex] = data.classification; // Store in cache
                 displayMoveQualityIcon(data.classification, history[currentMoveIndex]);
             }
         });
@@ -206,17 +220,13 @@ $(document).ready(function() {
 
         socket.on('ai_commentary_text_result', function(data) {
             setAiCommentaryLoading(false);
-            let commentary = data.commentary || 'Received empty commentary from the AI.';
-            
-            commentary = commentary
-                .replace(/\*\*(.*?)\*\*/g, '<strong class="text-white font-semibold">$1</strong>')
-                .replace(/\*(.*?)\*/g, '<em class="italic">$1</em>')
-                .replace(/\n/g, '<br>');
-
-            $('#ai-commentary').html(commentary);
+            commentaryCache[currentMoveIndex] = data.commentary; // Store in cache
+            displayCommentary(data.commentary);
         });
         
         socket.on('ai_commentary_audio_result', function(data) {
+            if (!isAudioEnabled) { return; } 
+
             if (currentAudio) {
                 currentAudio.pause();
                 currentAudio.currentTime = 0;
@@ -243,10 +253,24 @@ $(document).ready(function() {
         });
     }
 
-    function requestAnalysis(fen) {
+    function requestAnalysis(fen, moveIndex) {
         if (!socket || !stockfishEnabled) return;
-        
-        if (currentMoveIndex > -1) {
+
+        // --- NEW: Check cache before making requests ---
+        if (analysisCache[moveIndex]) {
+            setAnalysisLoadingState(false);
+            updateAnalysisUI(analysisCache[moveIndex]);
+            if (commentaryCache[moveIndex]) {
+                displayCommentary(commentaryCache[moveIndex]);
+            }
+            if (moveQualityCache[moveIndex]) {
+                displayMoveQualityIcon(moveQualityCache[moveIndex], history[moveIndex]);
+            }
+            return; // Exit if we are using cached data
+        }
+
+        // --- Original logic if not cached ---
+        if (moveIndex > -1) {
             $('#ai-commentary').html('<span class="italic text-text-secondary">Waiting for engine analysis...</span>');
         } else {
              $('#ai-commentary').html('<span class="italic text-text-secondary">Navigate moves to see AI commentary.</span>');
@@ -260,6 +284,13 @@ $(document).ready(function() {
             settings: stockfishSettings,
             requestId: requestId
         });
+
+        if (moveIndex >= 0) {
+            socket.emit('get_move_quality', {
+                fen_before: fens[moveIndex],
+                fen_after: fens[moveIndex + 1]
+            });
+        }
     }
 
     function updateAnalysisUI(data) {
@@ -361,7 +392,7 @@ $(document).ready(function() {
         }
         
         currentMoveIndex = moveIndex;
-        hideMoveQualityIcon(); // Hide icon immediately while new one is being calculated
+        hideMoveQualityIcon(); 
 
         if (moveIndex !== lastAiCommentaryPly) {
              lastAiCommentaryPly = -1;
@@ -378,15 +409,7 @@ $(document).ready(function() {
             activeMoveEl[0].scrollIntoView({ behavior: 'smooth', block: 'nearest' });
         }
         
-        requestAnalysis(newFen);
-        
-        // Request real-time move quality check
-        if (socket && stockfishEnabled && currentMoveIndex >= 0) {
-            socket.emit('get_move_quality', {
-                fen_before: fens[currentMoveIndex],
-                fen_after: newFen
-            });
-        }
+        requestAnalysis(newFen, currentMoveIndex);
     }
     
     const boardConfig = {
@@ -403,13 +426,13 @@ $(document).ready(function() {
         const { width, height } = entries[0].contentRect;
         const size = Math.min(width, height);
         const boardEl = document.getElementById('board');
-        const overlayEl = document.getElementById('board-overlay'); // Get the new overlay element
+        const overlayEl = document.getElementById('board-overlay'); 
 
         if (boardEl) {
             boardEl.style.width = `${size}px`;
             boardEl.style.height = `${size}px`;
         }
-        if (overlayEl) { // Ensure the overlay always matches the board size
+        if (overlayEl) { 
             overlayEl.style.width = `${size}px`;
             overlayEl.style.height = `${size}px`;
         }
@@ -417,13 +440,8 @@ $(document).ready(function() {
             board.resize();
             clearArrows();
             const currentFen = fens[currentMoveIndex + 1];
-            if (currentFen) requestAnalysis(currentFen);
-            if (currentMoveIndex >= 0 && socket && stockfishEnabled) {
-                 // Re-request quality icon on resize to ensure it's re-positioned correctly
-                 socket.emit('get_move_quality', {
-                    fen_before: fens[currentMoveIndex],
-                    fen_after: fens[currentMoveIndex + 1]
-                });
+            if (currentFen) {
+                requestAnalysis(currentFen, currentMoveIndex);
             }
         }
     }).observe(boardContainer);
@@ -449,12 +467,14 @@ $(document).ready(function() {
     const $threadsSlider = $('#threads-slider');
     const $depthValue = $('#depth-value');
     const $threadsValue = $('#threads-value');
+    const $audioToggle = $('#audio-toggle');
     
     $('#stockfish-settings-btn').on('click', () => {
         $depthSlider.val(stockfishSettings.depth);
         $threadsSlider.val(stockfishSettings.threads);
         $depthValue.text(stockfishSettings.depth);
         $threadsValue.text(stockfishSettings.threads);
+        $audioToggle.prop('checked', isAudioEnabled); 
         $modal.removeClass('hidden').addClass('flex');
     });
     
@@ -468,10 +488,23 @@ $(document).ready(function() {
     $modal.on('click', function(e) { if (e.target === this) closeModal(); });
     
     $('#settings-save-btn').on('click', () => {
+        const oldDepth = stockfishSettings.depth;
         stockfishSettings.depth = parseInt($depthSlider.val());
         stockfishSettings.threads = parseInt($threadsSlider.val());
+        isAudioEnabled = $audioToggle.is(':checked'); 
+
+        if (!isAudioEnabled && currentAudio) {
+            currentAudio.pause(); 
+            currentAudio = null;
+        }
+
         closeModal();
-        const currentFen = fens[currentMoveIndex + 1];
-        requestAnalysis(currentFen);
+        
+        // If analysis settings changed, clear cache and re-analyze current position
+        if (oldDepth !== stockfishSettings.depth) {
+            analysisCache = {};
+            commentaryCache = {};
+            requestAnalysis(fens[currentMoveIndex + 1], currentMoveIndex);
+        }
     });
 });

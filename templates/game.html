@@ -166,11 +166,12 @@
     <div id="settings-modal" class="fixed inset-0 bg-black/60 z-50 hidden items-center justify-center p-4">
         <div class="bg-secondary rounded-lg shadow-xl w-full max-w-md border border-border-primary">
             <div class="p-6 border-b border-border-primary">
-                <h3 class="text-lg font-bold text-text-primary">Engine Settings</h3>
-                <p class="text-sm text-text-secondary mt-1">Adjust analysis speed vs. quality. Lower depth is faster.</p>
+                <h3 class="text-lg font-bold text-text-primary">Settings</h3>
             </div>
             <div class="p-6 space-y-6">
                 <div>
+                    <h4 class="text-base font-bold text-text-primary mb-2">Engine Settings</h4>
+                    <p class="text-sm text-text-secondary mt-1 mb-4">Adjust analysis speed vs. quality. Lower depth is faster.</p>
                     <label for="depth-slider" class="flex justify-between text-sm font-medium text-text-primary mb-2">
                         <span>Analysis Depth</span>
                         <span id="depth-value" class="font-mono">18</span>
@@ -183,6 +184,17 @@
                         <span id="threads-value" class="font-mono">4</span>
                     </label>
                     <input id="threads-slider" type="range" min="1" max="16" value="4" class="w-full h-2 bg-tertiary rounded-lg appearance-none cursor-pointer accent-accent">
+                </div>
+                <!-- NEW AUDIO TOGGLE -->
+                <div class="border-t border-border-primary pt-6">
+                    <h4 class="text-base font-bold text-text-primary mb-2">Commentary Settings</h4>
+                    <label for="audio-toggle" class="flex items-center justify-between cursor-pointer">
+                        <span class="text-sm font-medium text-text-primary">Enable Audio Commentary</span>
+                        <div class="relative">
+                            <input id="audio-toggle" type="checkbox" class="sr-only peer">
+                            <div class="w-11 h-6 bg-tertiary rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-accent"></div>
+                        </div>
+                    </label>
                 </div>
             </div>
             <div class="px-6 py-4 bg-tertiary/50 flex justify-end gap-3 rounded-b-lg">

@@ -11,6 +11,7 @@ from typing import List, Optional, Dict
 import base64
 import mimetypes
 import struct
+from datetime import datetime
 
 import requests
 import chess
@@ -132,34 +133,55 @@ def parse_audio_mime_type(mime_type: str) -> dict[str, int | None]:
 def validate_username(username: str) -> bool: return bool(USERNAME_RE.match(username))
 def validate_game_id(game_id: str) -> bool: return bool(GAMEID_RE.match(game_id))
 
-def get_games_for_user(username: str, max_games: int = 10) -> Optional[List[Dict]]:
+def get_games_for_user(username: str, max_games: int = 10, since: int = None, until: int = None) -> Optional[Dict]:
     if not validate_username(username): return None
     url = f"{LICHESS_API_URL}/games/user/{username}"
     headers = API_HEADERS.copy()
     headers['Accept'] = 'application/x-chess-pgn'
     params = {'max': max_games, 'opening': 'true', 'clocks': 'true'}
+    if since: params['since'] = since
+    if until: params['until'] = until
+
     try:
         resp = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         multi_pgn_text = resp.text
-        if not multi_pgn_text: return []
+        if not multi_pgn_text: return {'games': [], 'count': 0}
+
         games_data: List[Dict] = []
         pgn_io = io.StringIO(multi_pgn_text)
+        newest_timestamp, oldest_timestamp = 0, float('inf')
+
         while True:
             game = chess.pgn.read_game(pgn_io)
             if game is None: break
             headers_map = game.headers
+            
+            # Extract timestamp for pagination
+            utc_date = headers_map.get('UTCDate', '1970.01.01')
+            utc_time = headers_map.get('UTCTime', '00:00:00')
+            try:
+                dt_obj = datetime.strptime(f"{utc_date} {utc_time}", "%Y.%m.%d %H:%M:%S")
+                timestamp_ms = int(dt_obj.timestamp() * 1000)
+                newest_timestamp = max(newest_timestamp, timestamp_ms)
+                oldest_timestamp = min(oldest_timestamp, timestamp_ms)
+            except ValueError:
+                timestamp_ms = None # Skip if format is unexpected
+
             site_url = headers_map.get('Site', '')
             gid = site_url.split('/')[-1] if site_url.startswith('https://lichess.org/') else None
             if not gid: continue
+            
             exporter = chess.pgn.StringExporter(headers=True, variations=True, comments=True)
             single_pgn_text = game.accept(exporter)
             GAME_CACHE[gid] = single_pgn_text
+            
             result = headers_map.get('Result', '')
             if result == '1-0': result_text = '1-0 (White win)'
             elif result == '0-1': result_text = '0-1 (Black win)'
             elif result == '1/2-1/2': result_text = '1/2-1/2 (Draw)'
             else: result_text = headers_map.get('Termination', 'Unknown')
+            
             games_data.append({
                 'id': gid,
                 'white_player': f"{headers_map.get('White', '?')} ({headers_map.get('WhiteElo', '?')})",
@@ -167,7 +189,13 @@ def get_games_for_user(username: str, max_games: int = 10) -> Optional[List[Dict
                 'result': result_text,
                 'date': headers_map.get('UTCDate', 'N/A')
             })
-        return games_data
+
+        return {
+            'games': games_data,
+            'count': len(games_data),
+            'newest_timestamp': newest_timestamp,
+            'oldest_timestamp': oldest_timestamp
+        }
     except requests.exceptions.RequestException as e:
         logger.error("Error fetching games for user %s: %s", username, e)
         return None
@@ -175,17 +203,44 @@ def get_games_for_user(username: str, max_games: int = 10) -> Optional[List[Dict
 @app.route('/', methods=['GET', 'POST'])
 def index():
     games, username, error = [], '', None
+    page = 1
+    newest_timestamp, oldest_timestamp, games_count = 0, 0, 0
+
     if request.method == 'POST':
         username = (request.form.get('username') or '').strip()
-        if not username: error = 'Please enter a username.'
-        elif not validate_username(username): error = 'Invalid username format.'
+    else: # GET request
+        username = (request.args.get('username') or '').strip()
+        page = request.args.get('page', 1, type=int)
+
+    if username:
+        if not validate_username(username): 
+            error = 'Invalid username format.'
         else:
             GAME_CACHE.clear()
-            fetched = get_games_for_user(username)
-            if fetched is None: error = f"Could not fetch games for '{username}'. The user may not exist or the API is unavailable."
-            elif not fetched: error = f"No recent games found for '{username}'."
-            else: games = fetched
-    return render_template('index.html', games=games, username=username, error=error)
+            since = request.args.get('since', type=int)
+            until = request.args.get('until', type=int)
+            
+            fetched_data = get_games_for_user(username, since=since, until=until)
+            
+            if fetched_data is None: 
+                error = f"Could not fetch games for '{username}'. The user may not exist or the API is unavailable."
+            elif not fetched_data['games']: 
+                error = f"No more games found for '{username}'." if page > 1 else f"No recent games found for '{username}'."
+            else: 
+                games = fetched_data['games']
+                newest_timestamp = fetched_data['newest_timestamp']
+                oldest_timestamp = fetched_data['oldest_timestamp']
+                games_count = fetched_data['count']
+
+    return render_template('index.html', 
+        games=games, 
+        username=username, 
+        error=error,
+        page=page,
+        newest_timestamp=newest_timestamp,
+        oldest_timestamp=oldest_timestamp,
+        games_count=games_count
+    )
 
 @app.route('/game/<game_id>')
 def view_game(game_id: str):
@@ -271,7 +326,7 @@ def analysis_worker(sid: str, q: queue.Queue):
         except Exception as e:
             logger.error("Error in analysis worker for sid %s: %s", sid, e, exc_info=True)
             socketio.emit('analysis_error', {'message': 'Worker thread encountered an error.'}, room=sid)
-    stockfish.quit()
+    del stockfish # Use del to quit the engine process
     logger.info("Stopped analysis worker for sid: %s", sid)
 
 # --- SOCKETIO HANDLERS ---
@@ -361,7 +416,7 @@ def handle_move_quality_request(data):
         logger.error("Error during real-time move quality check for sid %s: %s", sid, e)
     finally:
         if stockfish:
-            stockfish.quit()
+            del stockfish # Use del to quit the engine process
 
 def full_game_analysis_threaded(sid: str, fens: List[str]):
     """Calculates overall accuracy for the entire game."""
@@ -398,7 +453,7 @@ def full_game_analysis_threaded(sid: str, fens: List[str]):
         socketio.emit('analysis_error', {'message': 'Could not calculate accuracy.'}, room=sid)
     finally:
         if stockfish:
-            stockfish.quit()
+            del stockfish # Use del to quit the engine process
 
 @socketio.on('request_full_analysis')
 def handle_full_analysis_request(data):
@@ -432,6 +487,7 @@ def handle_ai_commentary_request(data):
         engine_best_move = data.get('engineBestMove', 'N/A')
         evaluation = format_evaluation(data.get('evaluation', {}))
         top_lines = data.get('topLines', [])
+        audio_enabled = data.get('audio_enabled', False) # Check for audio flag
         
         top_lines_str = "\n".join([
             f"- {line['san']} (Eval: {format_evaluation({'type': 'cp', 'value': line.get('cp', 0)}) if line.get('mate') is None else format_evaluation({'type': 'mate', 'value': line.get('mate')})})"
@@ -469,9 +525,8 @@ Based on your principles and the provided data, generate a brief, expert comment
         
         socketio.emit('ai_commentary_text_result', {'commentary': text_commentary}, room=sid)
 
-        # 2. GENERATE AND EMIT AUDIO (Only if TTS client is available)
-        if not tts_client:
-            logger.warning("TTS client not configured, skipping audio generation.")
+        # 2. GENERATE AND EMIT AUDIO (Only if TTS client is available AND user enabled it)
+        if not (audio_enabled and tts_client):
             return
 
         tts_model_name = "gemini-2.5-flash-preview-tts"
