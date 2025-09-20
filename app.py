@@ -303,27 +303,86 @@ def handle_analysis_request(data):
     if sid in analysis_queues:
         analysis_queues[sid].put(data)
 
-# --- ACCURACY ANALYSIS ---
+# --- ACCURACY AND MOVE QUALITY ANALYSIS ---
 def get_cp_value(evaluation: dict) -> int:
     if evaluation['type'] == 'cp': return evaluation['value']
     if evaluation['type'] == 'mate':
         return 30000 - evaluation['value'] if evaluation['value'] > 0 else -30000 + abs(evaluation['value'])
     return 0
 
+def classify_move(clamped_cp_loss: int, cp_before: int, cp_after: int, is_white_move: bool) -> str:
+    """Classifies a move based on centipawn loss and game state."""
+    is_winning_before = cp_before > 200 if is_white_move else cp_before < -200
+    is_not_winning_after = -200 <= cp_after <= 200 or \
+                           (is_white_move and cp_after < -200) or \
+                           (not is_white_move and cp_after > 200)
+
+    if is_winning_before and is_not_winning_after:
+        return 'blunder'
+
+    if clamped_cp_loss <= 15: return 'best'
+    if clamped_cp_loss <= 40: return 'excellent'
+    if clamped_cp_loss <= 90: return 'good'
+    if clamped_cp_loss <= 200: return 'inaccuracy'
+    if clamped_cp_loss <= 450: return 'mistake'
+    return 'blunder'
+
+@socketio.on('get_move_quality')
+def handle_move_quality_request(data):
+    """Handles real-time, single-move quality classification."""
+    sid = request.sid
+    fen_before = data.get('fen_before')
+    fen_after = data.get('fen_after')
+
+    if not STOCKFISH_PATH or not fen_before or not fen_after:
+        return
+
+    stockfish = None
+    try:
+        # Use a shallow depth for quick feedback
+        stockfish = Stockfish(path=STOCKFISH_PATH, depth=12, parameters={"Threads": 1, "Hash": 64})
+        
+        stockfish.set_fen_position(fen_before)
+        eval_before = stockfish.get_evaluation()
+        cp_before = get_cp_value(eval_before)
+        
+        stockfish.set_fen_position(fen_after)
+        eval_after = stockfish.get_evaluation()
+        cp_after = get_cp_value(eval_after)
+        
+        is_white_move = chess.Board(fen_before).turn == chess.WHITE
+        cp_loss = (cp_before - cp_after) if is_white_move else (cp_after - cp_before)
+        clamped_loss = max(0, cp_loss)
+        
+        classification = classify_move(clamped_loss, cp_before, cp_after, is_white_move)
+        
+        socketio.emit('move_quality_result', {'classification': classification}, room=sid)
+    except Exception as e:
+        logger.error("Error during real-time move quality check for sid %s: %s", sid, e)
+    finally:
+        if stockfish:
+            stockfish.quit()
+
 def full_game_analysis_threaded(sid: str, fens: List[str]):
+    """Calculates overall accuracy for the entire game."""
+    stockfish = None
     try:
         stockfish = Stockfish(path=STOCKFISH_PATH, depth=14, parameters={"Threads": 1, "Hash": 64})
         white_accuracies, black_accuracies = [], []
+        
         for i in range(len(fens) - 1):
             stockfish.set_fen_position(fens[i])
             eval_before = stockfish.get_evaluation()
             cp_before = get_cp_value(eval_before)
+            
             stockfish.set_fen_position(fens[i+1])
             eval_after = stockfish.get_evaluation()
             cp_after = get_cp_value(eval_after)
+            
             is_white_move = chess.Board(fens[i]).turn == chess.WHITE
             cp_loss = (cp_before - cp_after) if is_white_move else (cp_after - cp_before)
             clamped_loss = max(0, cp_loss)
+            
             move_accuracy = 103 * math.exp(-0.004 * clamped_loss) - 3
             move_accuracy = max(0, min(100, move_accuracy))
 
@@ -332,12 +391,14 @@ def full_game_analysis_threaded(sid: str, fens: List[str]):
 
         accuracy_white = round(sum(white_accuracies) / len(white_accuracies)) if white_accuracies else 100
         accuracy_black = round(sum(black_accuracies) / len(black_accuracies)) if black_accuracies else 100
+        
         socketio.emit('full_analysis_complete', {'white': accuracy_white, 'black': accuracy_black}, room=sid)
     except Exception as e:
         logger.error("Full game analysis failed for sid %s: %s", sid, e, exc_info=True)
         socketio.emit('analysis_error', {'message': 'Could not calculate accuracy.'}, room=sid)
     finally:
-        pass
+        if stockfish:
+            stockfish.quit()
 
 @socketio.on('request_full_analysis')
 def handle_full_analysis_request(data):

@@ -38,15 +38,17 @@
             overflow: hidden; pointer-events: none; z-index: 10;
         }
         .arrow-wrapper { position: absolute; transform-origin: 0 50%; }
+        /* --- THICKER ARROW STYLE --- */
         .arrow-shaft {
-            position: absolute; left: 0; top: 50%; height: 14%; width: 100%;
-            background-image: linear-gradient(to right, rgba(20, 80, 220, 0.85), rgba(40, 120, 255, 0.75));
-            transform: translateY(-50%); border-radius: 999px; box-shadow: 0 1px 3px rgba(0,0,0,0.5);
+            position: absolute; left: 0; top: 50%;
+            background-color: rgba(135, 204, 71, 0.75);
+            transform: translateY(-50%);
         }
         .arrow-head {
-            position: absolute; right: 0; top: 50%; width: 45%; height: 50%;
-            background-image: linear-gradient(to right, rgba(20, 80, 220, 0.85), rgba(40, 120, 255, 0.75));
-            clip-path: polygon(0% 0%, 100% 50%, 0% 100%); transform: translateY(-50%); box-shadow: 1px 1px 3px rgba(0,0,0,0.5);
+            position: absolute; right: 0; top: 50%;
+            background-color: rgba(135, 204, 71, 0.75);
+            clip-path: polygon(0% 0%, 100% 50%, 0% 100%); /* Full triangular head */
+            transform: translateY(-50%);
         }
     </style>
 </head>
@@ -133,6 +135,13 @@
                         <div id="board-container" class="relative min-w-0 min-h-0 flex-grow h-full flex justify-center items-center">
                             <div id="board"></div>
                             <div id="arrow-container"></div>
+                            <!-- NEW OVERLAY to precisely match the board's position and size -->
+                            <div id="board-overlay" class="absolute pointer-events-none" style="z-index: 11;">
+                                <div id="move-quality-indicator" class="absolute transition-opacity opacity-0" style="width: 12.5%; height: 12.5%;">
+                                    <!-- Icon is shifted up and right to sit on the corner of the square -->
+                                    <img id="move-quality-icon" src="" alt="Move Quality" class="absolute w-5 h-5 sm:w-6 sm:h-6 -top-1 -right-1" />
+                                </div>
+                            </div>
                         </div>
                     </div>
                     <div class="flex-shrink-0 w-full flex justify-between items-center py-1 px-1">

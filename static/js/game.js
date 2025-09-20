@@ -1,5 +1,32 @@
 // static/js/game.js
 
+const moveQualityMap = {
+    blunder: {
+        icon: '/static/img/symbols/blunder.png',
+        text: 'Blunder'
+    },
+    mistake: {
+        icon: '/static/img/symbols/mistake.png',
+        text: 'Mistake'
+    },
+    inaccuracy: {
+        icon: '/static/img/symbols/inaccuracy.png',
+        text: 'Inaccuracy'
+    },
+    good: {
+        icon: '/static/img/symbols/good.png',
+        text: 'Good Move'
+    },
+    excellent: {
+        icon: '/static/img/symbols/excellent.png',
+        text: 'Excellent Move'
+    },
+    best: {
+        icon: '/static/img/symbols/best.png',
+        text: 'Best Move'
+    }
+};
+
 $(document).ready(function() {
     let socket = null;
     let analysisRequestCounter = 0;
@@ -49,10 +76,11 @@ $(document).ready(function() {
         const length = Math.sqrt(dx * dx + dy * dy);
         const angleRad = Math.atan2(dy, dx);
         
+        // --- THICKER ARROW PROPORTIONS ---
         const squareSize = boardRect.width / 8;
-        const headWidth = squareSize * 0.45;
-        const headHeight = squareSize * 0.50;
-        const shaftHeight = squareSize * 0.14;
+        const headWidth = squareSize * 0.5;
+        const headHeight = squareSize * 0.7; 
+        const shaftHeight = squareSize * 0.30; // Increased shaft thickness
         
         const $wrapper = $('<div>').addClass('arrow-wrapper').css({
             left: fromCenter.x,
@@ -62,9 +90,12 @@ $(document).ready(function() {
             transform: `rotate(${angleRad}rad)`,
         });
 
+        // Shorten the shaft so it doesn't poke through the arrowhead
+        const shaftLength = length - (headWidth * 0.8);
+
         const $shaft = $('<div>').addClass('arrow-shaft').css({
              height: shaftHeight,
-             width: length - (headWidth * 0.9),
+             width: shaftLength > 0 ? shaftLength : 0,
         });
 
         const $head = $('<div>').addClass('arrow-head').css({
@@ -94,6 +125,34 @@ $(document).ready(function() {
             isAiThinking = false;
         }
     }
+    
+    function displayMoveQualityIcon(classification, move) {
+        const $indicator = $('#move-quality-indicator');
+        const $icon = $('#move-quality-icon');
+        const quality = moveQualityMap[classification];
+
+        if (!quality || !move) {
+            $indicator.addClass('opacity-0');
+            return;
+        }
+
+        const toSquare = move.to;
+        // Assuming white's orientation at the bottom
+        const fileIndex = toSquare.charCodeAt(0) - 'a'.charCodeAt(0);
+        const rankIndex = 8 - parseInt(toSquare.charAt(1));
+
+        const left = (fileIndex * 12.5) + '%';
+        const top = (rankIndex * 12.5) + '%';
+        
+        $indicator.css({ left: left, top: top });
+        $icon.attr('src', quality.icon);
+        $indicator.attr('title', quality.text);
+        $indicator.removeClass('opacity-0');
+    }
+    
+    function hideMoveQualityIcon() {
+        $('#move-quality-indicator').addClass('opacity-0');
+    }
 
     if (stockfishEnabled) {
         socket = io();
@@ -103,7 +162,6 @@ $(document).ready(function() {
             setAnalysisLoadingState(false); 
             updateAnalysisUI(data);
 
-            // CRITICAL BUG FIX: Use '===' to ensure the AI is triggered only ONCE at the final depth.
             const isFinalDepth = data.depth === stockfishSettings.depth;
 
             if (isFinalDepth && !isAiThinking && currentMoveIndex !== lastAiCommentaryPly) {
@@ -129,6 +187,12 @@ $(document).ready(function() {
                 };
 
                 socket.emit('get_ai_commentary', commentaryPayload);
+            }
+        });
+
+        socket.on('move_quality_result', function(data) {
+            if (data.classification) {
+                displayMoveQualityIcon(data.classification, history[currentMoveIndex]);
             }
         });
 
@@ -297,6 +361,7 @@ $(document).ready(function() {
         }
         
         currentMoveIndex = moveIndex;
+        hideMoveQualityIcon(); // Hide icon immediately while new one is being calculated
 
         if (moveIndex !== lastAiCommentaryPly) {
              lastAiCommentaryPly = -1;
@@ -312,7 +377,16 @@ $(document).ready(function() {
             activeMoveEl.addClass('move-active');
             activeMoveEl[0].scrollIntoView({ behavior: 'smooth', block: 'nearest' });
         }
+        
         requestAnalysis(newFen);
+        
+        // Request real-time move quality check
+        if (socket && stockfishEnabled && currentMoveIndex >= 0) {
+            socket.emit('get_move_quality', {
+                fen_before: fens[currentMoveIndex],
+                fen_after: newFen
+            });
+        }
     }
     
     const boardConfig = {
@@ -329,15 +403,28 @@ $(document).ready(function() {
         const { width, height } = entries[0].contentRect;
         const size = Math.min(width, height);
         const boardEl = document.getElementById('board');
+        const overlayEl = document.getElementById('board-overlay'); // Get the new overlay element
+
         if (boardEl) {
             boardEl.style.width = `${size}px`;
             boardEl.style.height = `${size}px`;
+        }
+        if (overlayEl) { // Ensure the overlay always matches the board size
+            overlayEl.style.width = `${size}px`;
+            overlayEl.style.height = `${size}px`;
         }
         if (board) {
             board.resize();
             clearArrows();
             const currentFen = fens[currentMoveIndex + 1];
             if (currentFen) requestAnalysis(currentFen);
+            if (currentMoveIndex >= 0 && socket && stockfishEnabled) {
+                 // Re-request quality icon on resize to ensure it's re-positioned correctly
+                 socket.emit('get_move_quality', {
+                    fen_before: fens[currentMoveIndex],
+                    fen_after: fens[currentMoveIndex + 1]
+                });
+            }
         }
     }).observe(boardContainer);
     
