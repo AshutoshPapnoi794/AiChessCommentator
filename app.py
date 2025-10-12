@@ -24,10 +24,9 @@ from dotenv import load_dotenv
 
 from tactics_analyzer import TacticsAnalyzer
 
-# --- CORRECTED GEMINI IMPORTS ---
-import google.generativeai as genai_text_model  # For the text model
-from google import genai as genai_tts_client     # For the TTS Client
-from google.genai import types                   # Shared types
+# --- UNIFIED GEMINI IMPORTS ---
+import google.generativeai as genai
+from google.generativeai import types
 
 load_dotenv()
 
@@ -38,28 +37,33 @@ socketio = SocketIO(app)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- STOCKFISH SETUP ---
-STOCKFISH_PATH = os.getenv('STOCKFISH_PATH')
-if not STOCKFISH_PATH:
-    candidate_names = [
-        'stockfish-ubuntu-x86-64-avx2', 'stockfish', 'stockfish-linux-x86-64-avx2'
-    ]
+
+# --- ENVIRONMENT AND PATH SETUP ---
+def find_stockfish_executable():
+    """Finds a valid Stockfish executable path."""
+    stockfish_path = os.getenv('STOCKFISH_PATH')
+    if stockfish_path and os.path.exists(stockfish_path) and os.access(stockfish_path, os.X_OK):
+        logger.info("Using Stockfish executable from STOCKFISH_PATH: %s", stockfish_path)
+        return stockfish_path
+
+    candidate_names = ['stockfish-ubuntu-x86-64-avx2', 'stockfish', 'stockfish-linux-x86-64-avx2']
     for name in candidate_names:
         candidate_path = os.path.join('stockfish', name)
         if os.path.exists(candidate_path):
-            STOCKFISH_PATH = candidate_path
-            logging.info("Found potential Stockfish executable at: %s", STOCKFISH_PATH)
-            break
-if not STOCKFISH_PATH or not os.path.exists(STOCKFISH_PATH):
-    logging.warning("Stockfish executable not found. Analysis will be disabled.")
-    STOCKFISH_PATH = None
-elif not os.access(STOCKFISH_PATH, os.X_OK):
-    logging.error(
-        "Stockfish executable found at '%s' but it is NOT EXECUTABLE. "
-        "Please run 'chmod +x %s' in your terminal. Analysis is disabled.",
-        STOCKFISH_PATH, STOCKFISH_PATH
-    )
-    STOCKFISH_PATH = None
+            if os.access(candidate_path, os.X_OK):
+                logger.info("Found valid Stockfish executable at: %s", candidate_path)
+                return candidate_path
+            else:
+                logger.error(
+                    "Stockfish executable found at '%s' but it is NOT EXECUTABLE. "
+                    "Please run 'chmod +x %s' in your terminal.",
+                    candidate_path, candidate_path
+                )
+    return None
+
+STOCKFISH_PATH = find_stockfish_executable()
+if not STOCKFISH_PATH:
+    logging.warning("Stockfish executable not found or not executable. Analysis will be disabled.")
 
 # --- TACTICS ANALYZER SETUP ---
 tactics_analyzer = None
@@ -72,33 +76,33 @@ if STOCKFISH_PATH:
         logging.error("Failed to initialize TacticsAnalyzer: %s", e, exc_info=True)
         tactics_analyzer = None
 
-# --- GEMINI SETUP WITH TWO KEYS ---
-GEMINI_TEXT_API_KEY = os.getenv('GEMINI_TEXT_API_KEY')
-GEMINI_TTS_API_KEY = os.getenv('GEMINI_TTS_API_KEY')
 
+# --- UNIFIED GEMINI SETUP ---
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 text_model = None
 tts_client = None
 
-if not GEMINI_TEXT_API_KEY:
-    logging.warning("GEMINI_TEXT_API_KEY not found. Text AI features will be disabled.")
+if not GEMINI_API_KEY:
+    logging.warning("GEMINI_API_KEY not found. All AI features will be disabled.")
 else:
     try:
-        genai_text_model.configure(api_key=GEMINI_TEXT_API_KEY)
-        text_model = genai_text_model.GenerativeModel('gemini-2.5-flash')
-        logging.info("Gemini text model configured successfully with gemini-1.5-pro.")
-    except Exception as e:
-        logging.error("Failed to configure Gemini text model: %s", e, exc_info=True)
-        text_model = None
+        genai.configure(api_key=GEMINI_API_KEY)
 
-if not GEMINI_TTS_API_KEY:
-    logging.warning("GEMINI_TTS_API_KEY not found. Audio AI features will be disabled.")
-else:
-    try:
-        tts_client = genai_tts_client.Client(api_key=GEMINI_TTS_API_KEY)
-        logging.info("Gemini TTS client configured successfully.")
+        # Setup for Text Generation Model
+        text_model_name = os.getenv('GEMINI_TEXT_MODEL', 'gemini-1.5-flash')
+        text_model = genai.GenerativeModel(text_model_name)
+        logging.info("Gemini text model ('%s') configured successfully.", text_model_name)
+
+        # Setup for Text-to-Speech (TTS) Client and Model
+        # The standard client automatically handles authentication for all services.
+        # We specify the model during the generation call.
+        tts_model_name = os.getenv('GEMINI_TTS_MODEL', 'models/text-to-speech') # Example model
+        logging.info("Gemini services (including TTS model '%s') configured.", tts_model_name)
+        # Note: No separate tts_client is needed with the unified API.
+
     except Exception as e:
-        logging.error("Failed to configure Gemini TTS client: %s", e, exc_info=True)
-        tts_client = None
+        logging.error("Failed to configure Gemini services: %s", e, exc_info=True)
+        text_model = None
 
 # --- CONSTANTS AND GLOBALS ---
 LICHESS_API_URL = "https://lichess.org/api"
@@ -488,111 +492,125 @@ def format_tactical_analysis(analysis: Dict) -> str:
     return "\n".join(summary_points)
 
 
-@socketio.on('get_ai_commentary')
-def handle_ai_commentary_request(data):
-    sid = request.sid
-    if not text_model:
-        return socketio.emit('ai_commentary_text_result', {'commentary': 'AI text commentator is not available.'}, room=sid)
-
+def get_engine_recommendation(fen: str) -> str:
+    """Gets the best move from Stockfish for a given FEN."""
+    if not STOCKFISH_PATH:
+        return "N/A"
+    stockfish_temp = None
     try:
-        ply = data.get('ply', 0)
-        pgn = data.get('pgn', '')
-        human_move = data.get('humanMove', 'N/A')
-        evaluation = format_evaluation(data.get('evaluation', {}))
-        top_lines_now = data.get('topLines', [])
-        audio_enabled = data.get('audio_enabled', False)
-        current_fen = data.get('current_fen')
-        previous_fen = data.get('previous_fen')
-        
-        engine_best_move_before = "N/A"
-        if previous_fen and STOCKFISH_PATH:
-            stockfish_temp = None
-            try:
-                stockfish_temp = Stockfish(path=STOCKFISH_PATH, depth=14, parameters={"Threads": 1, "Hash": 64})
-                stockfish_temp.set_fen_position(previous_fen)
-                best_move_uci = stockfish_temp.get_best_move()
-                if best_move_uci:
-                    engine_best_move_before = chess.Board(previous_fen).san(chess.Move.from_uci(best_move_uci))
-            except Exception as e:
-                logger.error("Error getting best move from previous FEN: %s", e)
-            finally:
-                if stockfish_temp:
-                    del stockfish_temp
+        stockfish_temp = Stockfish(path=STOCKFISH_PATH, depth=14, parameters={"Threads": 1, "Hash": 64})
+        stockfish_temp.set_fen_position(fen)
+        best_move_uci = stockfish_temp.get_best_move()
+        if best_move_uci:
+            return chess.Board(fen).san(chess.Move.from_uci(best_move_uci))
+    except Exception as e:
+        logger.error("Error getting engine recommendation: %s", e)
+    finally:
+        if stockfish_temp:
+            del stockfish_temp
+    return "N/A"
 
-        top_lines_str = "\n".join([f"- {line['san']} (Eval: {format_evaluation({'type': 'cp', 'value': line.get('cp', 0)}) if line.get('mate') is None else format_evaluation({'type': 'mate', 'value': line.get('mate')})})" for line in top_lines_now[:2]])
-        
-        tactical_summary_str = ""
-        if tactics_analyzer and current_fen:
-            try:
-                tactical_analysis = tactics_analyzer.analyze(current_fen, previous_fen)
-                tactical_summary_str = format_tactical_analysis(tactical_analysis)
-            except Exception as e:
-                logger.error("Error during tactical analysis for sid %s: %s", sid, e)
-        
-        prompt = f"""
-You are an expert chess commentator providing commentary for club-level players.
-Analyze the move just played using the following structured data.
+def prepare_commentary_prompt(data: Dict) -> str:
+    """Prepares the prompt for the AI commentator."""
+    previous_fen = data.get('previous_fen')
+    engine_best_move_before = get_engine_recommendation(previous_fen) if previous_fen else "N/A"
+
+    top_lines_str = "\n".join([
+        f"- {line['san']} (Eval: {format_evaluation({'type': 'cp', 'value': line.get('cp', 0)}) if line.get('mate') is None else format_evaluation({'type': 'mate', 'value': line.get('mate')})})"
+        for line in data.get('topLines', [])[:2]
+    ])
+
+    tactical_summary_str = ""
+    if tactics_analyzer and data.get('current_fen'):
+        try:
+            tactical_analysis = tactics_analyzer.analyze(data['current_fen'], previous_fen)
+            tactical_summary_str = format_tactical_analysis(tactical_analysis)
+        except Exception as e:
+            logger.error("Error during tactical analysis: %s", e)
+
+    return f"""
+You are an expert chess commentator. Analyze the move just played.
 
 **Guiding Principles:**
-1.  **Game Phase:** Use the move number to determine the game phase (Opening: 1-15, Middlegame: 16-40, Endgame: 41+). Adapt your commentary style accordingly.
-2.  **Proportionality:** Match commentary intensity to the move's impact.
-3.  **Narrative Framing:** Tell a story. Focus on the *purpose* behind moves.
+1.  **Game Phase:** Use the move number to determine the game phase (Opening: 1-12, Middlegame: 13-40, Endgame: 41+).
+2.  **Proportionality:** Match commentary intensity to the move's impact. A minor inaccuracy is not a catastrophe.
+3.  **Narrative Framing:** Focus on the *purpose* behind moves. What was the player trying to achieve?
 
 {tactical_summary_str}
 
 **GAME CONTEXT**
-- Full PGN so far: {pgn}
-- Move Number: {ply // 2 + 1}
+- PGN so far: {data.get('pgn', '')}
+- Move Number: {data.get('ply', 0) // 2 + 1}
 
 **ANALYSIS OF THE MOVE**
-- **Position BEFORE the move (FEN):** {previous_fen}
+- Position BEFORE: {previous_fen}
 - Player to move was: {"White" if chess.Board(previous_fen).turn == chess.WHITE else "Black"}
-- Engine's recommendation was: **{engine_best_move_before}**
+- Engine recommendation was: **{engine_best_move_before}**
 
-- **The move ACTUALLY played:** **{human_move}**
+- The move ACTUALLY played: **{data.get('humanMove', 'N/A')}**
 
-- **Position AFTER the move (FEN):** {current_fen}
-- New evaluation is: **{evaluation}**
-- Engine's plan for the NEXT player is now:
+- Position AFTER: {data.get('current_fen')}
+- New evaluation is: **{format_evaluation(data.get('evaluation', {}))}**
+- Engine's top lines are now:
 {top_lines_str}
 
 **Your Task:**
-Based on all the data above, generate a brief, expert commentary on the move **{human_move}**. Compare it to what the engine wanted to do and explain the consequences. Use Markdown for emphasis.
+Generate a brief, expert commentary on the move **{data.get('humanMove', 'N/A')}**. Explain its purpose and consequences, comparing it to the engine's recommendation. Use Markdown for emphasis.
 """
-        
-        logger.info("=" * 50)
-        logger.info("PROMPT SENT TO GEMINI MODEL:")
+
+def generate_text_commentary(sid: str, prompt: str):
+    """Generates text commentary using the Gemini model."""
+    try:
+        logger.info("="*20 + " PROMPT SENT TO GEMINI " + "="*20)
         logger.info(prompt)
-        logger.info("=" * 50)
+        logger.info("="*50)
 
         text_response = text_model.generate_content(prompt)
         text_commentary = text_response.text
         socketio.emit('ai_commentary_text_result', {'commentary': text_commentary}, room=sid)
+        return text_commentary
+    except Exception as e:
+        logger.error("Error generating text commentary for sid %s: %s", sid, e, exc_info=True)
+        socketio.emit('ai_commentary_error', {'message': 'Failed to generate text commentary.'}, room=sid)
+        return None
 
-        if not (audio_enabled and tts_client): return
+def generate_audio_commentary(sid: str, text: str):
+    """Generates audio commentary using the Gemini TTS model."""
+    try:
+        tts_model_name = os.getenv('GEMINI_TTS_MODEL', 'models/text-to-speech')
 
-        tts_model_name = "gemini-2.5-flash-preview-tts"
-        contents = [types.Content(role="user", parts=[types.Part.from_text(text=text_commentary)])]
-        config = types.GenerateContentConfig(
-            response_modalities=["audio"],
-            speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Charon"))),
+        # The API expects a list of content parts
+        response = genai.generate_content(
+            model=tts_model_name,
+            prompt=text,
+            response_mime_type="audio/wav" # Request WAV directly
         )
-        audio_buffer = io.BytesIO()
-        first_chunk = True
-        mime_type = "audio/L16;rate=24000"
 
-        for chunk in tts_client.models.generate_content_stream(model=tts_model_name, contents=contents, config=config):
-            if chunk.candidates and chunk.candidates[0].content and chunk.candidates[0].content.parts and (part := chunk.candidates[0].content.parts[0]).inline_data:
-                if first_chunk: mime_type = part.inline_data.mime_type; first_chunk = False
-                audio_buffer.write(part.inline_data.data)
-
-        if audio_buffer.getbuffer().nbytes > 0:
-            wav_data = convert_to_wav(audio_buffer.getvalue(), mime_type)
-            socketio.emit('ai_commentary_audio_result', {'audio_data': base64.b64encode(wav_data).decode('utf-8')}, room=sid)
+        # The audio data is in response.audio_content
+        if response.audio_content:
+            socketio.emit('ai_commentary_audio_result', {
+                'audio_data': base64.b64encode(response.audio_content).decode('utf-8')
+            }, room=sid)
+        else:
+            logger.warning("TTS generation succeeded but returned no audio content.")
 
     except Exception as e:
-        logger.error("Error during AI commentary generation for sid %s: %s", sid, e, exc_info=True)
-        socketio.emit('ai_commentary_error', {'message': 'Failed to generate AI commentary.'}, room=sid)
+        logger.error("Error generating audio commentary for sid %s: %s", sid, e, exc_info=True)
+        socketio.emit('ai_commentary_error', {'message': 'Failed to generate audio commentary.'}, room=sid)
+
+
+@socketio.on('get_ai_commentary')
+def handle_ai_commentary_request(data):
+    """Handles the request for AI commentary, orchestrating prompt creation, text, and audio generation."""
+    sid = request.sid
+    if not text_model:
+        return socketio.emit('ai_commentary_text_result', {'commentary': 'AI text commentator is not available.'}, room=sid)
+
+    prompt = prepare_commentary_prompt(data)
+    text_commentary = generate_text_commentary(sid, prompt)
+
+    if text_commentary and data.get('audio_enabled'):
+        generate_audio_commentary(sid, text_commentary)
 
 if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=int(os.getenv('PORT', '5000')))

@@ -3,24 +3,14 @@
 import chess
 import chess.engine
 import os
-from typing import List, Dict, Optional, Any, Tuple
-
-# ==============================================================================
-# === TACTICS ANALYZER CLASS ===================================================
-# ==============================================================================
-# This class combines all the tactical and positional detection functions from
-# the settingUpMethods.ipynb notebook into a single, reusable module.
-#
-# It is designed to produce structured, detailed output suitable for guiding
-# a Large Language Model (LLM) in generating chess commentary or analysis.
-# The logic from the notebook has been preserved as requested.
-# ==============================================================================
-
+from typing import List, Dict, Optional, Any
 
 class TacticsAnalyzer:
     """
-    A class to analyze a chess position for various tactical and positional features.
-    It uses a persistent Stockfish engine instance for efficient analysis.
+    Analyzes chess positions for tactical and positional features using a Stockfish engine.
+
+    This class provides detailed, structured output suitable for guiding Large Language Models (LLMs)
+    in generating chess commentary. It uses a persistent engine instance for efficiency.
     """
 
     PIECE_VALUES = {
@@ -31,26 +21,30 @@ class TacticsAnalyzer:
         chess.PAWN: 100, chess.KNIGHT: 320, chess.BISHOP: 330,
         chess.ROOK: 500, chess.QUEEN: 900, chess.KING: 20000
     }
+    HIGH_VALUE_THRESHOLD_FOR_FORK = PIECE_VALUES[chess.KNIGHT]
 
-
-    def __init__(self, engine_path: str):
+    def __init__(self, engine_path: str, analysis_depth: int = 14):
         """
-        Initializes the TacticsAnalyzer.
+        Initializes the analyzer with a chess engine.
 
         Args:
-            engine_path (str): The file path to the Stockfish executable.
+            engine_path (str): Path to the Stockfish executable.
+            analysis_depth (int): The default depth for engine analysis.
 
         Raises:
-            FileNotFoundError: If the Stockfish executable cannot be found.
+            FileNotFoundError: If the engine executable is not found at the given path.
+            chess.engine.EngineError: If the engine process fails to start.
         """
-        if not engine_path or not os.path.exists(engine_path):
-            raise FileNotFoundError(f"Stockfish engine not found at path: {engine_path}")
+        if not os.path.exists(engine_path):
+            raise FileNotFoundError(f"Chess engine not found at: {engine_path}")
+
         try:
             self.engine = chess.engine.SimpleEngine.popen_uci(engine_path)
-        except Exception as e:
+            self.analysis_limit = chess.engine.Limit(depth=analysis_depth)
+        except chess.engine.EngineError as e:
             print(f"Failed to initialize Stockfish engine: {e}")
             self.engine = None
-        self.HIGH_VALUE_THRESHOLD = self.PIECE_VALUES[chess.KNIGHT]
+            raise
 
 
     def close(self):
@@ -191,18 +185,21 @@ class TacticsAnalyzer:
         return self._verify_forks_with_engine(board, candidates)
 
     def _detect_fork_candidates(self, board: chess.Board) -> List[Dict]:
+        """Detects potential fork situations for all pieces."""
         candidates = []
         for sq in chess.SQUARES:
             piece = board.piece_at(sq)
-            if not piece: continue
-            
+            if not piece:
+                continue
+
             attacked_squares = board.attacks(sq)
-            targets = []
-            for target_sq in attacked_squares:
-                target_piece = board.piece_at(target_sq)
-                if target_piece and target_piece.color != piece.color and self._get_piece_value(target_piece) >= self.HIGH_VALUE_THRESHOLD:
-                    targets.append({"piece": target_piece.symbol(), "square": chess.square_name(target_sq)})
-            
+            targets = [
+                {"piece": board.piece_at(tsq).symbol(), "square": chess.square_name(tsq)}
+                for tsq in attacked_squares
+                if board.piece_at(tsq) and board.piece_at(tsq).color != piece.color and
+                   self._get_piece_value(board.piece_at(tsq)) >= self.HIGH_VALUE_THRESHOLD_FOR_FORK
+            ]
+
             if len(targets) >= 2:
                 candidates.append({
                     "forking_piece": piece.symbol(),
@@ -210,105 +207,117 @@ class TacticsAnalyzer:
                     "targets": targets
                 })
         return candidates
-    
+
     def _verify_forks_with_engine(self, board: chess.Board, fork_candidates: List[Dict]) -> List[Dict]:
-        if not fork_candidates: return []
+        """Uses the engine to verify if a fork is tactically sound."""
+        if not fork_candidates:
+            return []
 
         verified_forks = []
         for candidate in fork_candidates:
             forking_piece_sq = chess.parse_square(candidate['forking_piece_square'])
             forking_piece = board.piece_at(forking_piece_sq)
-            if not forking_piece: continue
-            
-            forking_color = forking_piece.color
-            temp_board = board.copy()
-            is_fork_sound = False
-            
-            try:
-                initial_info = self.engine.analyse(temp_board, chess.engine.Limit(depth=14))
-                eval_before = (initial_info["score"].pov(forking_color).score(mate_score=30000) or 0)
-
-                if temp_board.turn == forking_color:
-                    if 'pv' in initial_info and initial_info['pv']:
-                        best_move = initial_info['pv'][0]
-                        if any(best_move.from_square == forking_piece_sq and
-                               best_move.to_square == chess.parse_square(t['square']) for t in candidate['targets']):
-                            is_fork_sound = True
-                else:
-                    if 'pv' in initial_info and initial_info['pv']:
-                        temp_board.push(initial_info['pv'][0])
-                        info_after = self.engine.analyse(temp_board, chess.engine.Limit(depth=14))
-                        eval_after = (info_after["score"].pov(forking_color).score(mate_score=30000) or 0)
-                        if (eval_after - eval_before) > 90:
-                            is_fork_sound = True
-            except (chess.engine.EngineError, IndexError):
+            if not forking_piece:
                 continue
 
-            if is_fork_sound: verified_forks.append(candidate)
-                    
+            is_fork_sound = self._is_fork_sound(board.copy(), forking_piece, candidate['targets'])
+            if is_fork_sound:
+                verified_forks.append(candidate)
+
         return verified_forks
 
-    # --- TACTIC 3: SKEWERS (Restored from notebook cell 16ea11b3) -----------------
+    def _is_fork_sound(self, board: chess.Board, forking_piece: chess.Piece, targets: List[Dict]) -> bool:
+        """Helper to determine if a single fork is sound."""
+        try:
+            initial_info = self.engine.analyse(board, self.analysis_limit)
+            eval_before = self._get_pov_score(initial_info, forking_piece.color)
+
+            if board.turn == forking_piece.color:
+                # If it's our turn, check if the best move is one of the fork captures
+                if 'pv' in initial_info and initial_info['pv']:
+                    best_move = initial_info['pv'][0]
+                    target_squares = {chess.parse_square(t['square']) for t in targets}
+                    if best_move.from_square == forking_piece.from_square and best_move.to_square in target_squares:
+                        return True
+            else:
+                # If it's opponent's turn, see if their best move leads to a bad position for them
+                if 'pv' in initial_info and initial_info['pv']:
+                    board.push(initial_info['pv'][0])
+                    info_after = self.engine.analyse(board, self.analysis_limit)
+                    eval_after = self._get_pov_score(info_after, forking_piece.color)
+                    if (eval_after - eval_before) > 90:  # Threshold for significant gain
+                        return True
+        except (chess.engine.EngineError, IndexError):
+            return False
+        return False
+
+    def _get_pov_score(self, analysis_info: Dict, color: chess.Color) -> int:
+        """Extracts the score from analysis info from a specific color's perspective."""
+        score = analysis_info["score"].pov(color)
+        return score.score(mate_score=30000) or 0
+
+    # --- TACTIC 3: SKEWERS ---
 
     def _find_and_validate_skewers(self, board: chess.Board) -> List[Dict]:
-        candidates = self._find_skewer_candidates_from_notebook(board)
-        validated_skewers = []
-        for cand in candidates:
-            if self._validate_skewer_with_engine(board, cand):
-                 validated_skewers.append(cand)
-        return validated_skewers
+        """Finds and validates skewer tactical opportunities."""
+        candidates = self._find_skewer_candidates(board)
+        return [cand for cand in candidates if self._validate_skewer_with_engine(board, cand)]
 
-    def _find_skewer_candidates_from_notebook(self, board: chess.Board) -> List[Dict]:
+    def _find_skewer_candidates(self, board: chess.Board) -> List[Dict]:
+        """Identifies potential skewer candidates based on piece alignments."""
         candidates = []
-        for a_sq, a_piece in board.piece_map().items():
-            if a_piece.piece_type not in [chess.BISHOP, chess.ROOK, chess.QUEEN]: continue
-            for s_sq in board.attacks(a_sq):
-                s_piece = board.piece_at(s_sq)
-                if not s_piece or s_piece.color == a_piece.color: continue
-                ray = chess.SquareSet.ray(a_sq, s_sq)
-                if not ray: continue
-                
-                behind = [r for r in ray if r != s_sq and board.piece_at(r)]
-                if not behind: continue
-                b_sq = behind[0]
-                b_piece = board.piece_at(b_sq)
-                if not b_piece or b_piece.color != s_piece.color: continue
+        for attacker_sq, attacker_piece in board.piece_map().items():
+            if attacker_piece.piece_type not in [chess.BISHOP, chess.ROOK, chess.QUEEN]:
+                continue
+            for skewed_sq in board.attacks(attacker_sq):
+                skewed_piece = board.piece_at(skewed_sq)
+                if not skewed_piece or skewed_piece.color == attacker_piece.color:
+                    continue
 
-                if self._get_piece_value(s_piece) > self._get_piece_value(b_piece):
+                ray = chess.SquareSet.ray(attacker_sq, skewed_sq)
+                behind_pieces = [sq for sq in ray if sq != skewed_sq and board.piece_at(sq)]
+                if not behind_pieces:
+                    continue
+
+                behind_sq = behind_pieces[0]
+                behind_piece = board.piece_at(behind_sq)
+                if behind_piece and behind_piece.color == skewed_piece.color and \
+                   self._get_piece_value(skewed_piece) > self._get_piece_value(behind_piece):
                     candidates.append({
-                        "attacker_sq": a_sq, "attacker": a_piece,
-                        "skewed_sq": s_sq, "skewed": s_piece,
-                        "behind_sq": b_sq, "behind": b_piece,
+                        "attacker_sq": attacker_sq, "attacker": attacker_piece,
+                        "skewed_sq": skewed_sq, "skewed": skewed_piece,
+                        "behind_sq": behind_sq, "behind": behind_piece,
                     })
         return candidates
 
     def _validate_skewer_with_engine(self, board: chess.Board, candidate: Dict) -> bool:
+        """Uses the engine to validate if a skewer is a real tactical threat."""
         attacker_color = candidate["attacker"].color
-        skewed_color = candidate["skewed"].color
         a_sq, s_sq, b_sq = candidate["attacker_sq"], candidate["skewed_sq"], candidate["behind_sq"]
         
         try:
-            eval_before_info = self.engine.analyse(board, chess.engine.Limit(depth=14))
-            eval_before = eval_before_info["score"].pov(attacker_color).score(mate_score=10000)
+            eval_before = self._get_pov_score(self.engine.analyse(board, self.analysis_limit), attacker_color)
 
             move_capture = chess.Move(a_sq, s_sq)
-            if move_capture not in board.legal_moves: return False
+            if move_capture not in board.legal_moves:
+                return False
             
-            temp_board_capture = board.copy()
-            temp_board_capture.push(move_capture)
-            eval_after_capture = self.engine.analyse(temp_board_capture, chess.engine.Limit(depth=14))["score"].pov(attacker_color).score(mate_score=10000)
+            board_after_capture = board.copy()
+            board_after_capture.push(move_capture)
+            eval_after_capture = self._get_pov_score(self.engine.analyse(board_after_capture, self.analysis_limit), attacker_color)
 
-            if (eval_after_capture or 0) - (eval_before or 0) < 50: return False
+            if (eval_after_capture - eval_before) < 50:  # Not a significant gain from capture
+                return False
 
-            board_for_skewed = board.copy()
-            board_for_skewed.turn = skewed_color
+            board_for_skewed_move = board.copy()
+            board_for_skewed_move.turn = candidate["skewed"].color
             
-            best_move = self.engine.play(board_for_skewed, chess.engine.Limit(depth=14)).move
-            board_for_skewed.push(best_move)
-            eval_after_skewed_best = self.engine.analyse(board_for_skewed, chess.engine.Limit(depth=14))["score"].pov(attacker_color).score(mate_score=10000)
+            result = self.engine.play(board_for_skewed_move, self.analysis_limit)
+            board_for_skewed_move.push(result.move)
+            eval_after_skewed_best = self._get_pov_score(self.engine.analyse(board_for_skewed_move, self.analysis_limit), attacker_color)
 
-            still_attacked = board_for_skewed.is_attacked_by(attacker_color, b_sq)
-            eval_gain = (eval_after_capture or 0) - (eval_after_skewed_best or 0)
+            still_attacked = board_for_skewed_move.is_attacked_by(attacker_color, b_sq)
+            eval_gain = eval_after_capture - eval_after_skewed_best
 
             return eval_gain > 100 and still_attacked
         except (chess.engine.EngineError, IndexError, AttributeError):
@@ -367,52 +376,67 @@ class TacticsAnalyzer:
         return True
 
     def _find_clearance_sacrifice(self, prev_board: chess.Board, move: chess.Move) -> List[Dict]:
+        """
+        Identifies and validates if a move is a clearance sacrifice.
+        A clearance sacrifice opens a critical line or square for another piece.
+        """
         curr_board = prev_board.copy()
         curr_board.push(move)
-        sac_piece = prev_board.piece_at(move.from_square)
-        moving_color = sac_piece.color
+        moving_color = prev_board.color_at(move.from_square)
 
         if not self._is_true_sacrifice(curr_board, move, moving_color):
             return []
 
-        clearance_details = None
-        for piece_type in [chess.ROOK, chess.BISHOP, chess.QUEEN]:
-            for sq in prev_board.pieces(piece_type, moving_color):
-                if sq != move.from_square and (curr_board.attacks(sq) - prev_board.attacks(sq)):
-                    clearance_details = {"type": "Line-Clearing", "cleared_for_piece_on": chess.square_name(sq)}
-                    break
-            if clearance_details: break
-        
+        clearance_details = self._get_clearance_details(prev_board, curr_board, move)
         if not clearance_details:
-            vacated_sq = move.from_square
-            temp_board = curr_board.copy()
-            temp_board.turn = moving_color
-            for pt in [chess.QUEEN, chess.ROOK, chess.KNIGHT, chess.BISHOP]:
-                for mover_sq in curr_board.pieces(pt, moving_color):
-                    potential_move = chess.Move(mover_sq, vacated_sq)
-                    if potential_move in temp_board.legal_moves:
-                        b_after = temp_board.copy()
-                        b_after.push(potential_move)
-                        if b_after.is_check():
-                            clearance_details = {"type": "Square-Clearing (Vacating)", "vacated_square": chess.square_name(vacated_sq), "for_piece_on": chess.square_name(mover_sq)}
-                            break
-                if clearance_details: break
-        
-        if not clearance_details: return []
-            
+            return []
+
         try:
-            info_before = self.engine.analyse(prev_board, chess.engine.Limit(time=0.3))
-            info_after = self.engine.analyse(curr_board, chess.engine.Limit(time=0.3))
-            eval_change = self._score_to_float(info_after['score'], moving_color) - self._score_to_float(info_before['score'], moving_color)
+            # Use a slightly lower depth for this heuristic to keep it fast
+            limit = chess.engine.Limit(time=0.3)
+            info_before = self.engine.analyse(prev_board, limit)
+            info_after = self.engine.analyse(curr_board, limit)
             
+            eval_change = self._score_to_float(info_after['score'], moving_color) - \
+                          self._score_to_float(info_before['score'], moving_color)
+
+            # A sacrifice shouldn't result in a significantly worse position
             if eval_change < -1.5 and not info_after['score'].is_mate():
                 return []
-            
+
             return [{"evaluation_change": round(eval_change, 2), **clearance_details}]
         except (chess.engine.EngineError, IndexError):
             return []
 
-    # --- NEW: STATIC EXCHANGE EVALUATION (SEE) ANALYSIS ----------------------
+    def _get_clearance_details(self, prev_board: chess.Board, curr_board: chess.Board, move: chess.Move) -> Optional[Dict]:
+        """Determines if a sacrifice cleared a line or a square."""
+        moving_color = prev_board.color_at(move.from_square)
+
+        # Check for line-clearing
+        for piece_type in [chess.ROOK, chess.BISHOP, chess.QUEEN]:
+            for sq in prev_board.pieces(piece_type, moving_color):
+                if sq != move.from_square and (curr_board.attacks(sq) - prev_board.attacks(sq)):
+                    return {"type": "Line-Clearing", "cleared_for_piece_on": chess.square_name(sq)}
+
+        # Check for square-clearing (vacating)
+        vacated_sq = move.from_square
+        temp_board = curr_board.copy()
+        temp_board.turn = moving_color
+        for pt in [chess.QUEEN, chess.ROOK, chess.KNIGHT, chess.BISHOP]:
+            for mover_sq in curr_board.pieces(pt, moving_color):
+                potential_move = chess.Move(mover_sq, vacated_sq)
+                if potential_move in temp_board.legal_moves:
+                    b_after = temp_board.copy()
+                    b_after.push(potential_move)
+                    if b_after.is_check():
+                        return {
+                            "type": "Square-Clearing (Vacating)",
+                            "vacated_square": chess.square_name(vacated_sq),
+                            "for_piece_on": chess.square_name(mover_sq)
+                        }
+        return None
+
+    # --- STATIC EXCHANGE EVALUATION (SEE) ANALYSIS ---
     
     def _get_piece_identifier(self, board: chess.Board, square: int) -> str:
         """Creates a unique and readable string for a piece, e.g., 'white Queen at d1'."""
@@ -454,43 +478,58 @@ class TacticsAnalyzer:
         return score
 
     def _analyze_tactical_relationships(self, board: chess.Board) -> List[str]:
-        """Generates a list of tactical relationships based on SEE."""
+        """
+        Generates a list of tactical relationships (checks, threats, pressure) based on SEE.
+        This helps understand the tension and tactical possibilities in the position.
+        """
         relations = []
         processed_pairs = set()
 
         for victim_sq in chess.SQUARES:
             victim_piece = board.piece_at(victim_sq)
-            if not victim_piece: continue
+            if not victim_piece:
+                continue
 
             for attacker_sq in board.attackers(not victim_piece.color, victim_sq):
                 attacker_piece = board.piece_at(attacker_sq)
-                if not attacker_piece: continue
+                if not attacker_piece:
+                    continue
 
                 attacker_id = self._get_piece_identifier(board, attacker_sq)
                 victim_id = self._get_piece_identifier(board, victim_sq)
                 
+                # Ensure we only process each pair of interacting pieces once
                 canonical_pair = tuple(sorted((attacker_id, victim_id)))
-                if canonical_pair in processed_pairs: continue
-                
-                if victim_piece.piece_type == chess.KING:
-                    relations.append(f"{attacker_id} CHECKS the {victim_id}")
-                    processed_pairs.add(canonical_pair)
+                if canonical_pair in processed_pairs:
                     continue
 
-                see_attacker_wins = self._get_see_score(board, victim_sq, attacker_sq) > 0
-                see_victim_wins = False
-                if attacker_sq in board.attacks(victim_sq):
-                     see_victim_wins = self._get_see_score(board, attacker_sq, victim_sq) > 0
-
-                if see_attacker_wins:
-                    relations.append(f"{attacker_id} THREATENS the {victim_id}")
-                elif see_victim_wins:
-                    relations.append(f"{victim_id} THREATENS the {attacker_id}")
+                if victim_piece.piece_type == chess.KING:
+                    relations.append(f"{attacker_id} CHECKS the {victim_id}")
                 else:
-                    relations.append(f"{attacker_id} pressures the {victim_id}")
+                    relation = self._determine_see_relationship(board, attacker_sq, victim_sq)
+                    relations.append(relation)
                 
                 processed_pairs.add(canonical_pair)
+
         return sorted(relations)
+
+    def _determine_see_relationship(self, board: chess.Board, attacker_sq: int, victim_sq: int) -> str:
+        """Determines the nature of a tactical relationship using SEE."""
+        attacker_id = self._get_piece_identifier(board, attacker_sq)
+        victim_id = self._get_piece_identifier(board, victim_sq)
+
+        # Check if the attacker has a favorable capture
+        see_attacker_wins = self._get_see_score(board, victim_sq, attacker_sq) > 0
+        if see_attacker_wins:
+            return f"{attacker_id} THREATENS the {victim_id}"
+
+        # Check if the victim can profitably capture the attacker
+        if board.is_attacked_by(board.color_at(victim_sq), attacker_sq):
+            see_victim_wins = self._get_see_score(board, attacker_sq, victim_sq) > 0
+            if see_victim_wins:
+                return f"{victim_id} THREATENS the {attacker_id}"
+
+        return f"{attacker_id} pressures the {victim_id}"
 
     # --- POSITIONAL FEATURE: PASSED PAWNS --------------------------------------
 
