@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Lichess Game Viewer</title>
+    <link rel="preconnect" href="https://fonts.gstatic.com/" crossorigin />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&family=Sora:wght@600;700&display=swap" />
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined" rel="stylesheet" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}" />
+    <script src="https://cdn.tailwindcss.com?plugins=forms"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['"Manrope"', 'sans-serif'],
+                        display: ['"Sora"', 'sans-serif'],
+                    },
+                    colors: {
+                        slate: { 850: '#151e2e', 900: '#0f172a', 950: '#020617' }
+                    }
+                }
+            }
+        };
+    </script>
+</head>
+<body class="text-slate-100 antialiased h-full flex flex-col">
+    <header class="glass-panel fixed top-0 left-0 right-0 z-40 border-b border-white/5">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="h-16 flex items-center justify-between">
+                <a href="{{ url_for('index') }}" class="inline-flex items-center gap-3 hover:opacity-90 transition-opacity">
+                    <div class="w-9 h-9 rounded-lg bg-sky-500/15 border border-sky-400/25 flex items-center justify-center">
+                        <span class="material-symbols-outlined text-sky-300">chess</span>
+                    </div>
+                    <span class="font-display text-lg tracking-tight">Lichess Viewer</span>
+                </a>
+                <span class="hidden sm:inline text-xs uppercase tracking-[0.2em] text-slate-400">Analyze. Learn. Replay.</span>
+            </div>
+        </div>
+    </header>
+
+    <main class="flex-1 pt-16 relative">
+        <div class="absolute inset-0 pointer-events-none">
+            <div class="absolute inset-0 bg-pattern-grid opacity-25"></div>
+            <div class="absolute top-0 left-1/2 -translate-x-1/2 w-[980px] h-[540px] bg-sky-500/10 rounded-full blur-[120px]"></div>
+        </div>
+
+        <div class="relative z-10 max-w-6xl mx-auto px-4 sm:px-6 py-10 lg:py-16 space-y-8">
+            <section class="text-center max-w-3xl mx-auto space-y-4">
+                <h1 class="font-display text-4xl sm:text-5xl lg:text-6xl leading-tight">
+                    Understand Every Game,
+                    <span class="text-transparent bg-clip-text bg-gradient-to-r from-sky-300 to-amber-300">Move by Move</span>
+                </h1>
+                <p class="text-slate-300/90 text-base sm:text-lg">
+                    Search any Lichess player and instantly inspect recent games with engine evaluations, opening labels, and AI coach commentary.
+                </p>
+            </section>
+
+            <section class="max-w-3xl mx-auto space-y-3">
+                <form action="{{ url_for('index') }}" method="POST" id="search-form" class="surface-glow glass-panel rounded-2xl p-3">
+                    <div class="flex flex-col sm:flex-row items-stretch gap-3">
+                        <label for="username-input" class="sr-only">Lichess username</label>
+                        <div class="flex-1 flex items-center gap-2 rounded-xl bg-slate-950/55 border border-slate-700/70 px-4">
+                            <span class="material-symbols-outlined text-slate-500">person_search</span>
+                            <input
+                                id="username-input"
+                                name="username"
+                                class="w-full bg-transparent border-0 text-white placeholder-slate-500 text-base sm:text-lg h-12 sm:h-14 focus:ring-0"
+                                placeholder="Enter Lichess username"
+                                value="{{ username or '' }}"
+                                autocomplete="off"
+                                required
+                            />
+                        </div>
+                        <button id="search-submit" type="submit" class="h-12 sm:h-14 px-6 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-semibold transition-all inline-flex items-center justify-center gap-2 disabled:opacity-70 disabled:cursor-wait">
+                            <span id="search-button-text">Analyze</span>
+                            <span id="loader" class="loader rounded-full border-2 border-white/80 h-5 w-5 hidden"></span>
+                        </button>
+                    </div>
+                </form>
+
+                {% if error %}
+                <div class="glass-panel rounded-xl border border-red-500/35 bg-red-500/10 px-4 py-3 text-red-100 text-sm sm:text-base flex items-start gap-2">
+                    <span class="material-symbols-outlined text-red-300 text-lg">error</span>
+                    <span>{{ error }}</span>
+                </div>
+                {% endif %}
+            </section>
+
+            <section class="space-y-4">
+                {% if games or username %}
+                <div class="flex items-center justify-between gap-4 px-1">
+                    <h2 class="text-lg sm:text-xl font-display text-white">
+                        {% if games %}
+                            Recent games for
+                            <span class="text-sky-300">
+                                {{ games[0].white_player.split(' ')[0] if username.lower() in games[0].white_player.lower() else games[0].black_player.split(' ')[0] }}
+                            </span>
+                        {% else %}
+                            Search results
+                        {% endif %}
+                    </h2>
+                    {% if games %}
+                    <span class="text-xs sm:text-sm rounded-full px-3 py-1 analysis-pill text-slate-300">{{ games_count }} games</span>
+                    {% endif %}
+                </div>
+                {% endif %}
+
+                <div class="glass-panel rounded-2xl overflow-hidden">
+                    {% if games %}
+                    <div class="hidden md:block overflow-x-auto scrollbar-thin">
+                        <table class="w-full text-left border-collapse">
+                            <thead>
+                                <tr class="text-xs uppercase tracking-[0.16em] text-slate-400 border-b border-white/10 bg-slate-950/35">
+                                    <th class="px-6 py-4 font-semibold">Players</th>
+                                    <th class="px-6 py-4 font-semibold">Result</th>
+                                    <th class="px-6 py-4 font-semibold">Date</th>
+                                    <th class="px-6 py-4 text-right font-semibold">Action</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-slate-800/70 text-sm">
+                                {% for game in games %}
+                                {% set result_lower = game.result.lower() %}
+                                <tr class="hover:bg-white/5 transition-colors">
+                                    <td class="px-6 py-4">
+                                        <div class="space-y-1.5">
+                                            <div class="inline-flex items-center gap-2 text-white font-semibold">
+                                                <span class="w-2.5 h-2.5 rounded-full bg-white/95"></span>
+                                                {{ game.white_player }}
+                                            </div>
+                                            <div class="inline-flex items-center gap-2 text-slate-300">
+                                                <span class="w-2.5 h-2.5 rounded-full bg-slate-800 border border-slate-600"></span>
+                                                {{ game.black_player }}
+                                            </div>
+                                        </div>
+                                    </td>
+                                    <td class="px-6 py-4">
+                                        {% if game.result == '1-0' or game.result == '0-1' or 'win' in result_lower %}
+                                            <span class="inline-flex px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-300 border border-emerald-500/30">{{ game.result }}</span>
+                                        {% elif game.result == '1/2-1/2' or 'draw' in result_lower %}
+                                            <span class="inline-flex px-2.5 py-0.5 rounded-full text-xs font-semibold bg-slate-500/10 text-slate-300 border border-slate-500/35">{{ game.result }}</span>
+                                        {% else %}
+                                            <span class="inline-flex px-2.5 py-0.5 rounded-full text-xs font-semibold bg-amber-500/10 text-amber-300 border border-amber-500/30">{{ game.result }}</span>
+                                        {% endif %}
+                                    </td>
+                                    <td class="px-6 py-4 text-slate-400 font-mono text-xs">{{ game.date }}</td>
+                                    <td class="px-6 py-4 text-right">
+                                        <a href="{{ url_for('view_game', game_id=game.id) }}" class="inline-flex items-center gap-1.5 rounded-lg bg-slate-800 hover:bg-sky-600 px-4 py-2 text-sm font-semibold transition-colors">
+                                            Analyze
+                                            <span class="material-symbols-outlined text-base">arrow_forward</span>
+                                        </a>
+                                    </td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="md:hidden divide-y divide-white/10">
+                        {% for game in games %}
+                        {% set result_lower = game.result.lower() %}
+                        <article class="p-4 space-y-3">
+                            <div class="flex items-start justify-between gap-3">
+                                <div class="space-y-1">
+                                    <p class="text-white font-semibold text-sm leading-tight">{{ game.white_player }}</p>
+                                    <p class="text-slate-300 text-sm leading-tight">{{ game.black_player }}</p>
+                                </div>
+                                {% if game.result == '1-0' or game.result == '0-1' or 'win' in result_lower %}
+                                    <span class="inline-flex shrink-0 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/10 text-emerald-300 border border-emerald-500/30">{{ game.result }}</span>
+                                {% elif game.result == '1/2-1/2' or 'draw' in result_lower %}
+                                    <span class="inline-flex shrink-0 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-slate-500/10 text-slate-300 border border-slate-500/35">{{ game.result }}</span>
+                                {% else %}
+                                    <span class="inline-flex shrink-0 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-amber-500/10 text-amber-300 border border-amber-500/30">{{ game.result }}</span>
+                                {% endif %}
+                            </div>
+                            <div class="flex items-center justify-between">
+                                <span class="text-xs text-slate-400 font-mono">{{ game.date }}</span>
+                                <a href="{{ url_for('view_game', game_id=game.id) }}" class="inline-flex items-center gap-1 text-sky-300 font-semibold text-sm hover:text-sky-200 transition-colors">
+                                    Open
+                                    <span class="material-symbols-outlined text-sm">arrow_forward</span>
+                                </a>
+                            </div>
+                        </article>
+                        {% endfor %}
+                    </div>
+                    {% else %}
+                    <div class="px-5 py-14 text-center">
+                        <div class="w-14 h-14 mx-auto rounded-full bg-slate-800/80 border border-slate-700 flex items-center justify-center mb-4">
+                            <span class="material-symbols-outlined text-slate-400 text-3xl">chess</span>
+                        </div>
+                        <p class="text-slate-300 text-base sm:text-lg">
+                            {% if not username %}
+                                Enter a username to load recent games.
+                            {% elif not error %}
+                                No recent games found for this user.
+                            {% endif %}
+                        </p>
+                    </div>
+                    {% endif %}
+                </div>
+
+                {% if games %}
+                <div class="flex items-center justify-between gap-3 pt-1">
+                    {% if page > 1 %}
+                    <a href="{{ url_for('index', username=username, page=page-1, since=newest_timestamp) }}" class="inline-flex items-center gap-1.5 rounded-lg bg-slate-900/70 hover:bg-slate-800 px-4 py-2 text-sm text-slate-200 border border-slate-700/70 transition-colors">
+                        <span class="material-symbols-outlined text-base">arrow_back</span>
+                        Previous
+                    </a>
+                    {% else %}
+                    <span class="w-24 sm:w-28"></span>
+                    {% endif %}
+
+                    <span class="text-xs sm:text-sm text-slate-400 font-mono">Page {{ page }}</span>
+
+                    {% if games_count == 10 %}
+                    <a href="{{ url_for('index', username=username, page=page+1, until=oldest_timestamp) }}" class="inline-flex items-center gap-1.5 rounded-lg bg-slate-900/70 hover:bg-slate-800 px-4 py-2 text-sm text-slate-200 border border-slate-700/70 transition-colors">
+                        Next
+                        <span class="material-symbols-outlined text-base">arrow_forward</span>
+                    </a>
+                    {% else %}
+                    <span class="w-24 sm:w-28"></span>
+                    {% endif %}
+                </div>
+                {% endif %}
+            </section>
+        </div>
+    </main>
+
+    <footer class="relative z-10 mt-10 border-t border-white/10 py-6 text-center text-sm text-slate-400">
+        Powered by Stockfish, Gemini AI, and the Lichess API.
+    </footer>
+
+    <script>
+        document.getElementById('search-form').addEventListener('submit', function () {
+            const input = this.querySelector('input[name="username"]');
+            const username = input ? input.value.trim() : '';
+            if (!username) {
+                return;
+            }
+            const button = document.getElementById('search-submit');
+            document.getElementById('search-button-text').classList.add('hidden');
+            const loader = document.getElementById('loader');
+            loader.classList.remove('hidden');
+            if (button) {
+                button.disabled = true;
+            }
+        });
+    </script>
+</body>
+</html>

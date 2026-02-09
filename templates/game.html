@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+    <meta charset="utf-8" />
+    <meta content="width=device-width, initial-scale=1.0" name="viewport" />
+    <title>Chess Analysis</title>
+    <link rel="preconnect" href="https://fonts.gstatic.com/" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&family=Sora:wght@600;700&display=swap" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined" rel="stylesheet" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='lib/chessboard-1.0.0.css') }}" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}" />
+    <script src="https://cdn.tailwindcss.com?plugins=forms"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['"Manrope"', 'sans-serif'],
+                        display: ['"Sora"', 'sans-serif'],
+                    },
+                    colors: {
+                        slate: { 850: '#151e2e', 900: '#0f172a', 950: '#020617' }
+                    }
+                }
+            }
+        };
+    </script>
+</head>
+<body class="text-slate-100 h-full min-h-screen flex flex-col overflow-x-hidden selection:bg-sky-500/30">
+    <header class="glass-panel sticky top-0 z-40 border-b border-white/10">
+        <div class="h-14 px-4 sm:px-6 flex items-center justify-between">
+            <a href="{{ url_for('index') }}" class="inline-flex items-center gap-2 text-slate-100 hover:text-sky-300 transition-colors">
+                <span class="material-symbols-outlined">arrow_back</span>
+                <span class="font-display tracking-tight">Game Viewer</span>
+            </a>
+
+            <div class="flex items-center gap-2 sm:gap-3">
+                <span id="engine-status" class="analysis-pill text-[11px] sm:text-xs uppercase tracking-wider px-2.5 py-1 text-slate-300">
+                    {% if game.stockfish_enabled %}Engine Ready{% else %}Engine Offline{% endif %}
+                </span>
+                <span id="depth-chip" class="analysis-pill text-[11px] sm:text-xs uppercase tracking-wider px-2.5 py-1 text-slate-300">
+                    D16
+                </span>
+                {% if game.stockfish_enabled %}
+                <button id="settings-btn" class="w-9 h-9 rounded-lg border border-white/10 bg-slate-900/60 text-slate-300 hover:text-white hover:border-sky-300/40 transition" aria-label="Settings">
+                    <span class="material-symbols-outlined">tune</span>
+                </button>
+                {% endif %}
+            </div>
+        </div>
+    </header>
+
+    <main id="analysis-layout" class="flex-1 grid grid-cols-1 xl:grid-cols-[300px_minmax(0,1fr)_340px] gap-4 p-3 sm:p-4 lg:p-6 min-h-0 mobile-safe-padding">
+        <section class="glass-panel rounded-2xl p-4 flex flex-col gap-4 min-h-[300px] xl:min-h-0 order-3 xl:order-1">
+            <div class="rounded-xl border border-slate-700/70 bg-slate-950/40 p-4 flex flex-col gap-3 min-h-[220px] xl:flex-1">
+                <div class="flex items-center gap-3 border-b border-white/10 pb-3">
+                    <div class="w-10 h-10 rounded-full bg-gradient-to-br from-sky-500 to-amber-400 flex items-center justify-center shadow-lg">
+                        <span class="material-symbols-outlined text-slate-950">psychology</span>
+                    </div>
+                    <div>
+                        <h3 class="font-display text-white text-sm tracking-tight">GM Insight</h3>
+                        <p class="text-xs text-slate-400 uppercase tracking-[0.16em]">Narrative Coach</p>
+                    </div>
+                </div>
+                <div id="batch-progress-wrap" class="hidden rounded-lg border border-sky-400/30 bg-sky-500/10 px-3 py-2">
+                    <div class="flex items-center justify-between text-[11px] uppercase tracking-[0.12em] text-sky-200">
+                        <span id="batch-progress-label">Preparing full-game analysis...</span>
+                        <span id="batch-progress-pct">0%</span>
+                    </div>
+                    <div class="analysis-progress-track mt-2">
+                        <div id="batch-progress-fill" class="analysis-progress-fill" style="width: 0%;"></div>
+                    </div>
+                </div>
+                <div class="flex-1 overflow-y-auto scrollbar-thin pr-1">
+                    <p id="ai-commentary" class="text-slate-100 leading-relaxed text-sm sm:text-base">
+                        <span class="text-slate-500 italic">Select a move to begin AI coaching.</span>
+                    </p>
+                </div>
+            </div>
+
+            <div class="rounded-xl border border-slate-700/70 bg-slate-950/40 p-3 flex flex-col min-h-[160px]">
+                <div class="flex items-center justify-between mb-2">
+                    <h3 class="text-[11px] uppercase tracking-[0.16em] text-slate-500">Stockfish</h3>
+                    <span id="eval-score" class="font-mono font-semibold text-sm text-white analysis-pill px-2 py-0.5">0.00</span>
+                </div>
+                <div id="top-lines" class="text-sm text-slate-300 font-mono overflow-y-auto scrollbar-thin space-y-1 pr-1 flex-1">
+                    <span class="text-slate-500 text-xs italic">Waiting for engine...</span>
+                </div>
+            </div>
+        </section>
+
+        <section class="order-1 xl:order-2 flex flex-col items-center justify-start xl:justify-center gap-3 min-h-0">
+            <div class="w-full max-w-[720px] flex items-end justify-between gap-2 px-1">
+                <div class="flex items-center gap-2 min-w-0">
+                    <div class="w-8 h-8 rounded bg-slate-800 border border-slate-700 flex items-center justify-center text-xs font-bold text-slate-300 shrink-0">{{ game.black.rating }}</div>
+                    <div class="min-w-0">
+                        <div class="font-semibold text-white text-sm truncate">{{ game.black.name }}</div>
+                        <div class="text-[10px] uppercase tracking-[0.14em] text-slate-500">Black</div>
+                    </div>
+                </div>
+                <div id="clock-black" class="font-mono text-base sm:text-lg rounded bg-slate-900/80 border border-slate-700 px-2 py-0.5 text-slate-200 shrink-0">10:00</div>
+            </div>
+
+            <div class="relative flex items-stretch gap-2 board-shell">
+                <div class="w-3 rounded-full bg-slate-900 border border-slate-700/80 overflow-hidden flex flex-col-reverse shrink-0">
+                    <div id="eval-bar-fill" class="w-full bg-slate-100 h-[50%] transition-all duration-300"></div>
+                </div>
+                <div id="board-container" class="relative flex-1 rounded-xl overflow-hidden border-2 border-slate-700 bg-slate-900 shadow-2xl">
+                    <div id="board" class="w-full h-full"></div>
+                    <div id="arrow-layer" class="absolute inset-0 pointer-events-none"></div>
+                    <div id="move-quality-indicator" class="absolute z-20 pointer-events-none opacity-0">
+                        <img id="move-quality-icon" src="" alt="Move quality" class="move-quality-icon" />
+                    </div>
+                </div>
+            </div>
+
+            <div class="w-full max-w-[720px] flex items-start justify-between gap-2 px-1">
+                <div class="flex items-center gap-2 min-w-0">
+                    <div class="w-8 h-8 rounded bg-slate-100 border border-white/80 flex items-center justify-center text-xs font-bold text-slate-900 shrink-0">{{ game.white.rating }}</div>
+                    <div class="min-w-0">
+                        <div class="font-semibold text-white text-sm truncate">{{ game.white.name }}</div>
+                        <div class="text-[10px] uppercase tracking-[0.14em] text-slate-500">White</div>
+                    </div>
+                </div>
+                <div id="clock-white" class="font-mono text-base sm:text-lg rounded bg-slate-100 border border-white/80 px-2 py-0.5 text-slate-900 font-semibold shadow shrink-0">10:00</div>
+            </div>
+        </section>
+
+        <section class="glass-panel rounded-2xl overflow-hidden flex flex-col min-h-[320px] xl:min-h-0 order-2 xl:order-3">
+            <div class="px-4 py-3 border-b border-white/10 bg-slate-900/35">
+                <div class="text-[10px] uppercase tracking-[0.16em] text-slate-500">Opening</div>
+                <div id="opening-name" class="font-display text-white text-sm truncate" title="Starting Position">Starting Position</div>
+            </div>
+
+            <div id="move-list" class="flex-1 overflow-y-auto scrollbar-thin p-2 space-y-1 text-sm"></div>
+
+            <div class="p-2 bg-slate-900/50 border-t border-white/10 grid grid-cols-4 gap-2">
+                <button id="btn-start" class="h-9 rounded-lg border border-white/10 text-slate-300 hover:text-white hover:bg-white/10 transition" title="Start">
+                    <span class="material-symbols-outlined">first_page</span>
+                </button>
+                <button id="btn-prev" class="h-9 rounded-lg border border-white/10 text-slate-300 hover:text-white hover:bg-white/10 transition" title="Previous move">
+                    <span class="material-symbols-outlined">chevron_left</span>
+                </button>
+                <button id="btn-next" class="h-9 rounded-lg border border-white/10 text-slate-300 hover:text-white hover:bg-white/10 transition" title="Next move">
+                    <span class="material-symbols-outlined">chevron_right</span>
+                </button>
+                <button id="btn-end" class="h-9 rounded-lg border border-white/10 text-slate-300 hover:text-white hover:bg-white/10 transition" title="End">
+                    <span class="material-symbols-outlined">last_page</span>
+                </button>
+            </div>
+        </section>
+    </main>
+
+    <div id="settings-modal" class="fixed inset-0 z-50 hidden items-center justify-center bg-black/75 backdrop-blur-sm p-4">
+        <div class="glass-panel rounded-2xl w-full max-w-md p-5 sm:p-6">
+            <h2 class="font-display text-xl text-white mb-4">Analysis Settings</h2>
+            <div class="space-y-5">
+                <div>
+                    <label for="depth-slider" class="text-sm text-slate-300 flex items-center justify-between mb-2">
+                        Search Depth
+                        <span id="depth-val" class="font-mono text-slate-100">16</span>
+                    </label>
+                    <input type="range" id="depth-slider" min="10" max="22" value="16" class="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-sky-500" />
+                </div>
+                <div class="flex items-center justify-between">
+                    <span class="text-sm text-slate-300">Voice Commentary</span>
+                    <label class="relative inline-flex items-center cursor-pointer">
+                        <input type="checkbox" id="audio-toggle" class="sr-only peer" />
+                        <div class="w-11 h-6 bg-slate-700 peer-focus:outline-none rounded-full peer-checked:bg-sky-600 after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:h-5 after:w-5 after:bg-white after:border after:border-slate-300 after:rounded-full after:transition-all peer-checked:after:translate-x-full"></div>
+                    </label>
+                </div>
+            </div>
+            <div class="mt-7 flex justify-end gap-2">
+                <button id="modal-close" class="px-4 py-2 rounded-lg border border-white/10 text-slate-300 hover:text-white transition">Cancel</button>
+                <button id="modal-save" class="px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-semibold transition">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+    <script src="{{ url_for('static', filename='lib/chessboard-1.0.0.min.js') }}"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+    <script>
+        window.GAME_DATA = {
+            startFen: {{ game.start_fen|tojson }},
+            moves: {{ game.moves_data|tojson }},
+            stockfish: {{ game.stockfish_enabled|tojson }},
+            openings: {{ game.opening_names_by_ply|tojson }},
+            initialTime: {{ game.initial_time_seconds|tojson }}
+        };
+    </script>
+    <script src="{{ url_for('static', filename='js/game.js') }}"></script>
+</body>
+</html>
