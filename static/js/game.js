@@ -11,6 +11,7 @@
         miss: { icon: '/static/img/symbols/miss.png', text: 'Miss' },
         book: { icon: '/static/img/symbols/book.png', text: 'Book Move' },
     };
+    const SILENT_WAV_DATA_URI = 'data:audio/wav;base64,UklGRgQCAABXQVZFZm10IBAAAAABAAEAwF0AAIC7AAACABAAZGF0YeABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=';
 
     const data = window.GAME_DATA || {};
     if (typeof Chess === 'undefined' || typeof Chessboard === 'undefined') {
@@ -32,6 +33,7 @@
         socket: null,
         audioEnabled: false,
         currentAudio: null,
+        audioPrimed: false,
         commentaryCache: new Map(),
         batchCommentaryReady: false,
         batchCommentaryInFlight: false,
@@ -248,6 +250,9 @@
         el.depthSlider.value = String(state.analysisSettings.depth);
         el.depthVal.textContent = String(state.analysisSettings.depth);
         el.depthChip.textContent = `D${state.analysisSettings.depth}`;
+        if (el.audioToggle) {
+            el.audioToggle.checked = state.audioEnabled;
+        }
 
         el.depthSlider.addEventListener('input', () => {
             const depth = clampInt(Number(el.depthSlider.value), 10, 22, 16);
@@ -266,6 +271,16 @@
                 el.depthChip.textContent = `D${state.analysisSettings.depth}`;
                 if (el.audioToggle) {
                     state.audioEnabled = el.audioToggle.checked;
+                    if (!state.audioEnabled) {
+                        stopNarration();
+                        state.audioPrimed = false;
+                    } else if (state.currentPly > 0) {
+                        primeAudioPlayback();
+                        const currentCommentary = state.commentaryCache.get(state.currentPly);
+                        if (currentCommentary) {
+                            requestCommentaryAudio(currentCommentary, state.currentPly);
+                        }
+                    }
                 }
                 toggleSettingsModal(false);
                 if (stockfishEnabled && state.currentPly > 0) {
@@ -439,7 +454,9 @@
             hideBatchProgress();
 
             if (state.currentPly > 0 && state.commentaryCache.has(state.currentPly)) {
-                renderCommentary(state.commentaryCache.get(state.currentPly));
+                const currentText = state.commentaryCache.get(state.currentPly);
+                renderCommentary(currentText);
+                requestCommentaryAudio(currentText, state.currentPly);
             }
             if (state.currentPly > 0 && state.moveQualityCache.has(state.currentPly)) {
                 showMoveQualityIcon(state.currentPly, state.moveQualityCache.get(state.currentPly));
@@ -487,19 +504,27 @@
                 return;
             }
 
-            if (state.currentAudio) {
-                state.currentAudio.pause();
-                state.currentAudio = null;
-            }
+            stopCurrentAudioPlayback();
 
             try {
-                state.currentAudio = new Audio(`data:audio/wav;base64,${payload.audio_data}`);
-                state.currentAudio.play().catch(() => {
+                const mimeType = payload.audio_mime_type ? String(payload.audio_mime_type) : 'audio/wav';
+                state.currentAudio = new Audio(`data:${mimeType};base64,${payload.audio_data}`);
+                state.currentAudio.play().catch((error) => {
                     // Browser autoplay policy may block playback.
+                    console.warn('Audio playback failed:', error);
                 });
             } catch (error) {
-                // Ignore malformed audio payloads.
+                console.warn('Malformed audio payload received:', error);
             }
+        });
+
+        state.socket.on('ai_commentary_audio_error', (payload) => {
+            const ply = payload && Number.isFinite(Number(payload.ply)) ? Number(payload.ply) : state.currentPly;
+            if (ply !== state.currentPly) {
+                return;
+            }
+            const message = payload && payload.message ? String(payload.message) : 'TTS audio generation failed.';
+            console.warn(message);
         });
 
         state.socket.on('ai_commentary_error', (payload) => {
@@ -537,6 +562,10 @@
     function goTo(nextPly, userInitiated) {
         const maxPly = Math.min(history.length, fens.length - 1);
         const clampedPly = clampInt(nextPly, 0, maxPly, 0);
+        if (userInitiated && state.audioEnabled) {
+            primeAudioPlayback();
+        }
+        stopNarration();
         state.currentPly = clampedPly;
 
         board.position(fens[clampedPly], false);
@@ -580,6 +609,7 @@
         const cachedCommentary = state.commentaryCache.get(clampedPly);
         if (cachedCommentary) {
             renderCommentary(cachedCommentary);
+            requestCommentaryAudio(cachedCommentary, clampedPly);
         } else {
             if (state.batchCommentaryInFlight && !state.batchCommentaryFailed) {
                 renderCommentary('Analyzing full game commentary...');
@@ -669,6 +699,19 @@
             previous_fen: fens[state.currentPly - 1],
             opening: openings[state.currentPly] || 'Unknown',
             audio_enabled: state.audioEnabled,
+        });
+    }
+
+    function requestCommentaryAudio(commentary, ply) {
+        if (!state.socket || !state.audioEnabled || !commentary) {
+            return;
+        }
+        if (!Number.isFinite(ply) || ply <= 0) {
+            return;
+        }
+        state.socket.emit('synthesize_commentary_audio', {
+            ply,
+            commentary: String(commentary),
         });
     }
 
@@ -952,6 +995,37 @@
             return `${hours}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
         }
         return `${mins}:${String(secs).padStart(2, '0')}`;
+    }
+
+    function stopCurrentAudioPlayback() {
+        if (state.currentAudio) {
+            state.currentAudio.pause();
+            state.currentAudio = null;
+        }
+    }
+
+    function primeAudioPlayback() {
+        if (!state.audioEnabled || state.audioPrimed) {
+            return;
+        }
+        try {
+            const probe = new Audio(SILENT_WAV_DATA_URI);
+            probe.muted = true;
+            probe.play()
+                .then(() => {
+                    probe.pause();
+                    state.audioPrimed = true;
+                })
+                .catch(() => {
+                    // Keep retrying on next user interaction.
+                });
+        } catch (error) {
+            // Ignore priming failures.
+        }
+    }
+
+    function stopNarration() {
+        stopCurrentAudioPlayback();
     }
 
     function setEngineStatus(text) {
