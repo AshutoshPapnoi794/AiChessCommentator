@@ -114,6 +114,7 @@ STOCKFISH_PATH = _resolve_stockfish_path()
 ENGINE_THREADS = max(1, min(2, os.cpu_count() or 2))
 DEFAULT_ANALYSIS_DEPTH = 18
 COMMENTARY_DEPTH = 14
+DEFAULT_TACTICS_ENABLED = True
 
 if STOCKFISH_PATH:
     logger.info("Stockfish initialized at: %s", STOCKFISH_PATH)
@@ -221,6 +222,46 @@ def _safe_int(value: Any, default: int, min_value: int, max_value: int) -> int:
     except (TypeError, ValueError):
         parsed = default
     return max(min_value, min(max_value, parsed))
+
+
+def _safe_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _tactics_enabled_from_settings(settings: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(settings, dict):
+        return DEFAULT_TACTICS_ENABLED
+    for key in ("tacticsEnabled", "tactics_enabled"):
+        if key in settings:
+            return _safe_bool(settings.get(key), DEFAULT_TACTICS_ENABLED)
+    return DEFAULT_TACTICS_ENABLED
+
+
+def _bool_from_multidict(source: Any, key: str, default: bool) -> bool:
+    if source is None:
+        return default
+    try:
+        values = source.getlist(key)
+    except Exception:
+        values = []
+    if values:
+        return _safe_bool(values[-1], default)
+    try:
+        return _safe_bool(source.get(key), default)
+    except Exception:
+        return default
 
 
 def _cp_from_eval(eval_dict: Optional[Dict[str, Any]]) -> int:
@@ -373,12 +414,44 @@ def get_top_moves(sid: str, board: chess.Board, depth: int = COMMENTARY_DEPTH, c
 
 # ==================== TACTICAL ANALYSIS ====================
 
+def _empty_tactical_analysis() -> Dict[str, Any]:
+    return {
+        "tactical_patterns": [],
+        "strategic_themes": [],
+        "attack_info": {},
+        "pressure_info": {},
+        "is_brilliant": False,
+        "brilliant_details": {},
+    }
+
+
+def _build_analysis_after(
+    sid: str,
+    prev_board: Optional[chess.Board],
+    curr_board: chess.Board,
+    move: Optional[chess.Move],
+    tactics_enabled: bool,
+) -> Dict[str, Any]:
+    if not tactics_enabled:
+        return _empty_tactical_analysis()
+
+    analysis_after = tactics_analyzer.analyze(curr_board.fen(), prev_board.fen() if prev_board else None)
+    if move and prev_board:
+        analysis_after["attack_info"] = tactics_analyzer.detect_attack(prev_board, curr_board, move)
+        analysis_after["pressure_info"] = tactics_analyzer.detect_pressure(prev_board, curr_board, move)
+        is_brilliant, brilliant_details = tactics_analyzer.detect_brilliant_move(prev_board, curr_board, move, sid)
+        analysis_after["is_brilliant"], analysis_after["brilliant_details"] = is_brilliant, brilliant_details
+    return analysis_after
+
 def analyze_best_move_tactics(
     sid: str,
     board: chess.Board,
     best_move: chess.Move,
-    depth: int = COMMENTARY_DEPTH
+    depth: int = COMMENTARY_DEPTH,
+    tactics_enabled: bool = DEFAULT_TACTICS_ENABLED,
 ) -> Dict[str, Any]:
+    if not tactics_enabled:
+        return {}
     if not best_move or best_move not in board.legal_moves: return {}
     moving_piece = board.piece_at(best_move.from_square)
     if not moving_piece: return {}
@@ -449,8 +522,11 @@ def detect_missed_tactics(
     played_move: chess.Move,
     cp_before: int,
     cp_after: int,
-    quality: str
+    quality: str,
+    tactics_enabled: bool = DEFAULT_TACTICS_ENABLED,
 ) -> Dict[str, Any]:
+    if not tactics_enabled:
+        return {}
     if quality not in ["blunder", "mistake"]: return {}
     top_moves = get_top_moves(sid, board_before, depth=18, count=3)
     if not top_moves: return {}
@@ -458,7 +534,7 @@ def detect_missed_tactics(
     best = top_moves[0]
     if played_move and best["move"] == played_move: return {}
     
-    best_move_analysis = analyze_best_move_tactics(sid, board_before, best["move"])
+    best_move_analysis = analyze_best_move_tactics(sid, board_before, best["move"], tactics_enabled=tactics_enabled)
     eval_loss = abs(cp_after - cp_before) if board_before.turn == chess.WHITE else abs(cp_before - cp_after)
 
     return {
@@ -547,9 +623,9 @@ def build_rich_context(
     analysis_after: Dict[str, Any],
     cp_before: int,
     cp_after: int,
-    best_line: str,
     opening_name: str,
     missed_tactics: Optional[Dict[str, Any]] = None,
+    tactics_enabled: bool = DEFAULT_TACTICS_ENABLED,
 ) -> Dict[str, Any]:
     mover = prev_board.turn
     verified_facts = build_verified_facts(prev_board, curr_board, move)
@@ -569,9 +645,9 @@ def build_rich_context(
     eval_swing = (cp_after - cp_before) if mover == chess.WHITE else (cp_before - cp_after)
     eval_info = {"cp_after": cp_after, "formatted_after": _format_cp(cp_after), "swing": eval_swing, "is_turning_point": abs(cp_after - cp_before) >= 100}
 
-    capture_analysis = tactics_analyzer.analyze_capture(prev_board, curr_board, move) if move else {}
-    resolved_threats = tactics_analyzer.detect_resolved_threats(prev_board, curr_board, move) if move else []
-    hung_piece_info = tactics_analyzer.detect_hung_piece(prev_board, curr_board, move) if move else None
+    capture_analysis = tactics_analyzer.analyze_capture(prev_board, curr_board, move) if tactics_enabled and move else {}
+    resolved_threats = tactics_analyzer.detect_resolved_threats(prev_board, curr_board, move) if tactics_enabled and move else []
+    hung_piece_info = tactics_analyzer.detect_hung_piece(prev_board, curr_board, move) if tactics_enabled and move else None
 
     tactical_patterns = analysis_after.get("tactical_patterns", [])
 
@@ -912,6 +988,7 @@ def add_static_cache_headers(response):
 def index():
     username = (request.form.get("username") or request.args.get("username") or "").strip()
     page = request.args.get("page", 1, type=int)
+    tactics_enabled = _bool_from_multidict(request.values, "tactics_enabled", DEFAULT_TACTICS_ENABLED)
     games, error, newest_timestamp, oldest_timestamp, games_count = [], None, 0, 0, 0
 
     if username:
@@ -923,7 +1000,7 @@ def index():
             else:
                 games, newest_timestamp, oldest_timestamp, games_count = payload["games"], payload["newest_timestamp"], payload["oldest_timestamp"], payload["count"]
 
-    return render_template("index.html", games=games, username=username, error=error, page=page, newest_timestamp=newest_timestamp, oldest_timestamp=oldest_timestamp, games_count=games_count)
+    return render_template("index.html", games=games, username=username, error=error, page=page, newest_timestamp=newest_timestamp, oldest_timestamp=oldest_timestamp, games_count=games_count, tactics_enabled=tactics_enabled)
 
 def get_games_for_user(username: str, max_games: int = 10, since: Optional[int] = None, until: Optional[int] = None):
     cache_key = (username.lower(), max_games, since or 0, until or 0)
@@ -961,6 +1038,7 @@ def get_games_for_user(username: str, max_games: int = 10, since: Optional[int] 
 
 @app.route("/game/<game_id>")
 def view_game(game_id: str):
+    tactics_enabled = _bool_from_multidict(request.args, "tactics_enabled", DEFAULT_TACTICS_ENABLED)
     pgn_text = GAME_CACHE.get(game_id)
     if not pgn_text:
         response = lichess_get(f"game/export/{game_id}", params={"moves": "true", "clocks": "true", "opening": "true"})
@@ -981,7 +1059,7 @@ def view_game(game_id: str):
         moves_data.append({"san": san, "clock": node.clock(), "ply": node.ply()})
         board.push(node.move)
 
-    return render_template("game.html", game={"white": {"name": game.headers.get("White"), "rating": game.headers.get("WhiteElo")}, "black": {"name": game.headers.get("Black"), "rating": game.headers.get("BlackElo")}, "start_fen": game.headers.get("FEN"), "moves_data": moves_data, "initial_time_seconds": parse_initial_time_seconds(game.headers.get("TimeControl")), "stockfish_enabled": STOCKFISH_PATH is not None, "opening_names_by_ply": opening_names})
+    return render_template("game.html", game={"white": {"name": game.headers.get("White"), "rating": game.headers.get("WhiteElo")}, "black": {"name": game.headers.get("Black"), "rating": game.headers.get("BlackElo")}, "start_fen": game.headers.get("FEN"), "moves_data": moves_data, "initial_time_seconds": parse_initial_time_seconds(game.headers.get("TimeControl")), "stockfish_enabled": STOCKFISH_PATH is not None, "opening_names_by_ply": opening_names, "initial_tactics_enabled": tactics_enabled})
 
 
 # ==================== SOCKET HANDLERS ====================
@@ -1021,6 +1099,8 @@ def handle_move_quality_request(data: Dict[str, Any]):
 @socketio.on("get_ai_commentary")
 def handle_commentary_request(data: Dict[str, Any]):
     sid = request.sid
+    settings = data.get("settings") if isinstance(data, dict) else {}
+    tactics_enabled = _tactics_enabled_from_settings(settings)
     fen_before, fen_after, move_san, ply, opening_name, audio_enabled = data.get("previous_fen") or data.get("fen_before"), data.get("current_fen") or data.get("fen_after"), data.get("humanMove") or data.get("move_san", ""), data.get("ply", 0), data.get("opening", "Unknown"), bool(data.get("audio_enabled"))
 
     if not fen_after: return
@@ -1035,20 +1115,14 @@ def handle_commentary_request(data: Dict[str, Any]):
     cp_before, cp_after = get_commentary_eval(sid, fen_before) if fen_before else 0, get_commentary_eval(sid, fen_after)
     quality = classify_move_quality(cp_before, cp_after, prev_board.turn == chess.WHITE if prev_board else True)
 
-    best_line, missed_tactics = "", {}
-    if quality in ["blunder", "mistake"] or abs(cp_after - cp_before) >= 50: best_line = get_best_line_san(sid, curr_board)
+    missed_tactics = {}
     if quality in ["blunder", "mistake"] and prev_board and move:
-        try: missed_tactics = detect_missed_tactics(sid, prev_board, move, cp_before, cp_after, quality)
+        try: missed_tactics = detect_missed_tactics(sid, prev_board, move, cp_before, cp_after, quality, tactics_enabled=tactics_enabled)
         except Exception as e: logger.debug(f"Missed tactics error: {e}")
 
-    analysis_after = tactics_analyzer.analyze(fen_after, fen_before)
-    if move:
-        analysis_after["attack_info"] = tactics_analyzer.detect_attack(prev_board, curr_board, move)
-        analysis_after["pressure_info"] = tactics_analyzer.detect_pressure(prev_board, curr_board, move)
-        is_brilliant, brilliant_details = tactics_analyzer.detect_brilliant_move(prev_board, curr_board, move, sid)
-        analysis_after["is_brilliant"], analysis_after["brilliant_details"] = is_brilliant, brilliant_details
+    analysis_after = _build_analysis_after(sid, prev_board, curr_board, move, tactics_enabled)
 
-    context = build_rich_context(prev_board=prev_board or curr_board, curr_board=curr_board, move=move, move_san=move_san, analysis_after=analysis_after, cp_before=cp_before, cp_after=cp_after, best_line=best_line, opening_name=opening_name, missed_tactics=missed_tactics)
+    context = build_rich_context(prev_board=prev_board or curr_board, curr_board=curr_board, move=move, move_san=move_san, analysis_after=analysis_after, cp_before=cp_before, cp_after=cp_after, opening_name=opening_name, missed_tactics=missed_tactics, tactics_enabled=tactics_enabled)
 
     commentary = generate_gemini_commentary(context=context) if text_model else ""
     if not commentary: commentary = generate_fallback_commentary(context)
@@ -1078,13 +1152,15 @@ def _prewarm_audio_cache(commentaries: Dict[int, str]):
 def handle_batch_commentary_request(data: Dict[str, Any]):
     sid = request.sid
     try:
+        settings = data.get("settings") if isinstance(data, dict) else {}
+        tactics_enabled = _tactics_enabled_from_settings(settings)
         fens, moves, openings, game_key = data.get("fens", []), data.get("moves", []), data.get("openings", []), data.get("gameKey", "")
         if not fens or not moves:
             socketio.emit("batch_commentary_error", {"error": "Missing game data", "gameKey": game_key}, room=sid)
             return
 
         contexts, total = [], min(len(moves), len(fens) - 1)
-        socketio.emit("batch_commentary_progress", {"progress": 5, "message": f"Analyzing {total} moves...", "gameKey": game_key}, room=sid)
+        socketio.emit("batch_commentary_progress", {"progress": 5, "message": f"Preparing commentary for {total} moves...", "gameKey": game_key}, room=sid)
 
         for ply in range(1, total + 1):
             try:
@@ -1095,22 +1171,16 @@ def handle_batch_commentary_request(data: Dict[str, Any]):
                 cp_before, cp_after = get_commentary_eval(sid, fen_before), get_commentary_eval(sid, fen_after)
                 quality = classify_move_quality(cp_before, cp_after, prev_board.turn == chess.WHITE)
                 
-                best_line, missed_tactics = "", {}
+                missed_tactics = {}
                 if quality in ["blunder", "mistake"]:
-                    best_line = get_best_line_san(sid, curr_board)
-                    try: missed_tactics = detect_missed_tactics(sid, prev_board, move, cp_before, cp_after, quality)
+                    try: missed_tactics = detect_missed_tactics(sid, prev_board, move, cp_before, cp_after, quality, tactics_enabled=tactics_enabled)
                     except Exception: pass
 
-                analysis_after = tactics_analyzer.analyze(fen_after, fen_before)
-                if move:
-                    analysis_after["attack_info"] = tactics_analyzer.detect_attack(prev_board, curr_board, move)
-                    analysis_after["pressure_info"] = tactics_analyzer.detect_pressure(prev_board, curr_board, move)
-                    is_brilliant, brilliant_details = tactics_analyzer.detect_brilliant_move(prev_board, curr_board, move, sid)
-                    analysis_after["is_brilliant"], analysis_after["brilliant_details"] = is_brilliant, brilliant_details
+                analysis_after = _build_analysis_after(sid, prev_board, curr_board, move, tactics_enabled)
 
-                contexts.append(build_rich_context(prev_board=prev_board, curr_board=curr_board, move=move, move_san=move_san, analysis_after=analysis_after, cp_before=cp_before, cp_after=cp_after, best_line=best_line, opening_name=opening_name, missed_tactics=missed_tactics))
+                contexts.append(build_rich_context(prev_board=prev_board, curr_board=curr_board, move=move, move_san=move_san, analysis_after=analysis_after, cp_before=cp_before, cp_after=cp_after, opening_name=opening_name, missed_tactics=missed_tactics, tactics_enabled=tactics_enabled))
 
-                if ply % 5 == 0 or ply == total: socketio.emit("batch_commentary_progress", {"progress": int(5 + (ply / total) * 50), "message": f"Analyzed {ply}/{total} moves...", "gameKey": game_key}, room=sid)
+                if ply % 5 == 0 or ply == total: socketio.emit("batch_commentary_progress", {"progress": int(5 + (ply / total) * 50), "message": f"Prepared commentary data for {ply}/{total} moves...", "gameKey": game_key}, room=sid)
             except Exception as e:
                 logger.error(f"Error analyzing move {ply}: {e}"); continue
 

@@ -64,7 +64,7 @@
                 </div>
                 <div id="batch-progress-wrap" class="hidden rounded-lg border border-sky-400/30 bg-sky-500/10 px-3 py-2">
                     <div class="flex items-center justify-between text-[11px] uppercase tracking-[0.12em] text-sky-200">
-                        <span id="batch-progress-label">Preparing full-game analysis...</span>
+                        <span id="batch-progress-label">Preparing full-game commentary...</span>
                         <span id="batch-progress-pct">0%</span>
                     </div>
                     <div class="analysis-progress-track mt-2">
@@ -162,6 +162,16 @@
                     </label>
                     <input type="range" id="depth-slider" min="10" max="22" value="16" class="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-sky-500" />
                 </div>
+                <div class="flex items-center justify-between gap-4">
+                    <div>
+                        <div class="text-sm text-slate-300">Tactical Analyzer</div>
+                        <div class="text-xs text-slate-500">Patterns, threats, and brilliant-move detection</div>
+                    </div>
+                    <label class="relative inline-flex items-center cursor-pointer">
+                        <input type="checkbox" id="tactics-toggle" class="sr-only peer" checked />
+                        <div class="w-11 h-6 bg-slate-700 peer-focus:outline-none rounded-full peer-checked:bg-sky-600 after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:h-5 after:w-5 after:bg-white after:border after:border-slate-300 after:rounded-full after:transition-all peer-checked:after:translate-x-full"></div>
+                    </label>
+                </div>
                 <div class="flex items-center justify-between">
                     <span class="text-sm text-slate-300">Voice Commentary</span>
                     <label class="relative inline-flex items-center cursor-pointer">
@@ -187,7 +197,8 @@
             moves: {{ game.moves_data|tojson }},
             stockfish: {{ game.stockfish_enabled|tojson }},
             openings: {{ game.opening_names_by_ply|tojson }},
-            initialTime: {{ game.initial_time_seconds|tojson }}
+            initialTime: {{ game.initial_time_seconds|tojson }},
+            initialTacticsEnabled: {{ game.initial_tactics_enabled|tojson }}
         };
     </script>
     <script src="{{ url_for('static', filename='js/game.js') }}"></script>

@@ -190,8 +190,11 @@ class EnhancedTacticsAnalyzer:
 
         threats = []
         for move in board.legal_moves:
+            # Generate the SAN string BEFORE pushing the move!
+            san_move = board.san(move) 
             board.push(move)
-            if board.is_checkmate(): threats.append(f"Checkmate threat: {board.san(move)}")
+            if board.is_checkmate(): 
+                threats.append(f"Checkmate threat: {san_move}")
             board.pop()
 
         return KingSafetyAssessment(

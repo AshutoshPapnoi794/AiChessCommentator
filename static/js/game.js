@@ -27,6 +27,7 @@
     const openings = Array.isArray(data.openings) ? data.openings : [];
     const stockfishEnabled = Boolean(data.stockfish);
     const initialTime = Number.isFinite(Number(data.initialTime)) ? Number(data.initialTime) : 600;
+    const initialTacticsEnabled = typeof data.initialTacticsEnabled === 'boolean' ? data.initialTacticsEnabled : true;
 
     const state = {
         currentPly: 0,
@@ -44,6 +45,7 @@
         analysisSettings: {
             depth: 16,
             threads: 1,
+            tacticsEnabled: initialTacticsEnabled,
         },
         currentAnalysisRequestId: 0,
         typewriterTimer: null,
@@ -67,6 +69,7 @@
         depthChip: document.getElementById('depth-chip'),
         depthSlider: document.getElementById('depth-slider'),
         depthVal: document.getElementById('depth-val'),
+        tacticsToggle: document.getElementById('tactics-toggle'),
         audioToggle: document.getElementById('audio-toggle'),
         settingsBtn: document.getElementById('settings-btn'),
         settingsModal: document.getElementById('settings-modal'),
@@ -250,6 +253,9 @@
         el.depthSlider.value = String(state.analysisSettings.depth);
         el.depthVal.textContent = String(state.analysisSettings.depth);
         el.depthChip.textContent = `D${state.analysisSettings.depth}`;
+        if (el.tacticsToggle) {
+            el.tacticsToggle.checked = state.analysisSettings.tacticsEnabled;
+        }
         if (el.audioToggle) {
             el.audioToggle.checked = state.audioEnabled;
         }
@@ -267,14 +273,21 @@
         }
         if (el.modalSave) {
             el.modalSave.addEventListener('click', () => {
+                const tacticsChanged = el.tacticsToggle
+                    ? state.analysisSettings.tacticsEnabled !== el.tacticsToggle.checked
+                    : false;
+                const audioWasEnabled = state.audioEnabled;
                 state.analysisSettings.depth = clampInt(Number(el.depthSlider.value), 10, 22, 16);
                 el.depthChip.textContent = `D${state.analysisSettings.depth}`;
+                if (el.tacticsToggle) {
+                    state.analysisSettings.tacticsEnabled = el.tacticsToggle.checked;
+                }
                 if (el.audioToggle) {
                     state.audioEnabled = el.audioToggle.checked;
                     if (!state.audioEnabled) {
                         stopNarration();
                         state.audioPrimed = false;
-                    } else if (state.currentPly > 0) {
+                    } else if (!audioWasEnabled && state.currentPly > 0 && !tacticsChanged) {
                         primeAudioPlayback();
                         const currentCommentary = state.commentaryCache.get(state.currentPly);
                         if (currentCommentary) {
@@ -283,8 +296,18 @@
                     }
                 }
                 toggleSettingsModal(false);
+                if (tacticsChanged) {
+                    state.batchGameKey = computeGameKey();
+                    resetDerivedAnalysisState();
+                    if (state.currentPly > 0) {
+                        renderCommentary('Refreshing analysis...');
+                    }
+                }
                 if (stockfishEnabled && state.currentPly > 0) {
                     requestAnalysisForCurrentPosition();
+                    if (tacticsChanged) {
+                        requestCommentary();
+                    }
                 }
             });
         }
@@ -354,7 +377,6 @@
 
         state.socket.on('connect', () => {
             setEngineStatus('Engine Connected');
-            requestBatchCommentaryPrefetch(false);
         });
 
         state.socket.on('connect_error', () => {
@@ -411,7 +433,7 @@
             }
             const pctRaw = Number(payload.progress);
             const pct = Number.isFinite(pctRaw) ? Math.max(0, Math.min(100, Math.round(pctRaw))) : 0;
-            const message = payload.message ? String(payload.message) : 'Analyzing full game commentary...';
+            const message = payload.message ? String(payload.message) : 'Preparing full-game commentary...';
             showBatchProgress(pct, message);
             state.batchCommentaryInFlight = pct < 100;
             if (pct >= 100) {
@@ -487,11 +509,18 @@
             }
 
             state.commentaryCache.set(ply, commentary);
+            const quality = payload && payload.quality ? String(payload.quality).toLowerCase() : '';
+            if (quality && moveQualityMap[quality]) {
+                state.moveQualityCache.set(ply, quality);
+            }
             if (state.commentaryInFlightForPly === ply) {
                 state.commentaryInFlightForPly = null;
             }
             if (ply === state.currentPly) {
                 renderCommentary(commentary);
+                if (quality && moveQualityMap[quality]) {
+                    showMoveQualityIcon(ply, quality);
+                }
             }
         });
 
@@ -611,14 +640,8 @@
             renderCommentary(cachedCommentary);
             requestCommentaryAudio(cachedCommentary, clampedPly);
         } else {
-            if (state.batchCommentaryInFlight && !state.batchCommentaryFailed) {
-                renderCommentary('Analyzing full game commentary...');
-            } else if (state.batchCommentaryFailed) {
-                renderCommentary('Thinking...');
-                requestCommentary();
-            } else {
-                renderCommentary('Preparing full-game commentary...');
-            }
+            renderCommentary('Thinking...');
+            requestCommentary();
         }
     }
 
@@ -699,6 +722,7 @@
             previous_fen: fens[state.currentPly - 1],
             opening: openings[state.currentPly] || 'Unknown',
             audio_enabled: state.audioEnabled,
+            settings: state.analysisSettings,
         });
     }
 
@@ -719,6 +743,11 @@
         if (!state.socket || history.length === 0) {
             return;
         }
+        if (!state.analysisSettings.tacticsEnabled) {
+            state.batchCommentaryInFlight = false;
+            hideBatchProgress();
+            return;
+        }
         if (!force && (state.batchPrefetchAttempted || state.batchCommentaryInFlight || state.batchCommentaryReady)) {
             return;
         }
@@ -726,7 +755,7 @@
         state.batchPrefetchAttempted = true;
         state.batchCommentaryInFlight = true;
         state.batchCommentaryFailed = false;
-        showBatchProgress(0, 'Preparing full-game analysis...');
+        showBatchProgress(0, 'Preparing full-game commentary...');
 
         const sanMoves = history.map((move) => (move && move.san ? String(move.san) : ''));
         state.socket.emit('prefetch_ai_commentary_batch', {
@@ -735,6 +764,7 @@
             moves: sanMoves,
             openings,
             force: Boolean(force),
+            settings: state.analysisSettings,
         });
     }
 
@@ -758,6 +788,19 @@
         if (el.batchProgressWrap) {
             el.batchProgressWrap.classList.add('hidden');
         }
+    }
+
+    function resetDerivedAnalysisState() {
+        state.commentaryCache.clear();
+        state.moveQualityCache.clear();
+        state.commentaryInFlightForPly = null;
+        state.batchCommentaryReady = false;
+        state.batchCommentaryInFlight = false;
+        state.batchCommentaryFailed = false;
+        state.batchPrefetchAttempted = false;
+        stopNarration();
+        hideBatchProgress();
+        hideMoveQualityIcon();
     }
 
     function renderEvaluation(evalData) {
@@ -1035,7 +1078,7 @@
     }
 
     function computeGameKey() {
-        const seed = `${START_FEN}|${history.map((move) => (move && move.san ? move.san : '')).join(' ')}`;
+        const seed = `${START_FEN}|tactics=${state.analysisSettings.tacticsEnabled ? 1 : 0}|${history.map((move) => (move && move.san ? move.san : '')).join(' ')}`;
         let hash = 2166136261;
         for (let i = 0; i < seed.length; i += 1) {
             hash ^= seed.charCodeAt(i);
