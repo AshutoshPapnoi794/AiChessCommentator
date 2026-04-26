@@ -720,6 +720,8 @@
             humanMove: move.san,
             current_fen: fens[state.currentPly],
             previous_fen: fens[state.currentPly - 1],
+            previous_previous_fen: state.currentPly > 1 ? fens[state.currentPly - 2] : '',
+            previous_move_san: state.currentPly > 1 && history[state.currentPly - 2] ? history[state.currentPly - 2].san : '',
             opening: openings[state.currentPly] || 'Unknown',
             audio_enabled: state.audioEnabled,
             settings: state.analysisSettings,
@@ -879,7 +881,7 @@
         }
 
         clearTypewriter();
-        if (state.reduceMotion || text.length < 6) {
+        if (state.reduceMotion || text.length < 6 || text.includes('\n') || text.length > 420) {
             el.aiCommentary.textContent = text;
             return;
         }

@@ -1,0 +1,13 @@
+[Event "Grandmaster Fixture"]
+[Site "?"]
+[Date "2026.04.23"]
+[Round "?"]
+[White "Alpha"]
+[Black "Beta"]
+[Result "*"]
+[Opening "Ruy Lopez"]
+
+1. e4 {White claims the center immediately.} e5 {Black mirrors the central grab.}
+2. Nf3 {The knight develops and attacks e5.} Nc6 {Black develops and keeps e5 covered.}
+3. Bb5 {The bishop pins the knight on c6.} a6 {Black asks the bishop what it wants to do.}
+4. Bxc6 {White gives up the bishop to damage the pawn structure.} dxc6 {Black recaptures and accepts doubled pawns.} *

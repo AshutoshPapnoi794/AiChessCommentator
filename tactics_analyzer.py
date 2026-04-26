@@ -178,9 +178,12 @@ class EnhancedTacticsAnalyzer:
         if attackers >= 3 and escape_squares <= 1:
             safety_level = "exposed"
             description = f"The king is dangerously exposed with {attackers} attackers swarming it."
-        elif attackers >= 2 or open_lines >= 2 or (pawn_shield <= 1 and attackers >= 1):
+        elif attackers >= 2 and (open_lines >= 1 or pawn_shield <= 1):
             safety_level = "vulnerable"
             description = f"The king's position is shaky — {attackers} enemy pieces lurk nearby."
+        elif open_lines >= 2 and attackers >= 1:
+            safety_level = "vulnerable"
+            description = f"The king is vulnerable along open lines."
         elif pawn_shield >= 2 and attackers == 0 and open_lines == 0:
             safety_level = "secure"
             description = "The king sits securely behind a healthy pawn shield."
@@ -274,6 +277,8 @@ class EnhancedTacticsAnalyzer:
         patterns.extend(self._detect_skewers_enhanced(board))
         patterns.extend(self._detect_back_rank_threats(board))
         patterns.extend(self._detect_overloading(board))
+        patterns.extend(self._detect_trapped_pieces(board))
+        patterns.extend(self._detect_xray_attacks(board))
 
         if prev_board and move:
             patterns.extend(self._detect_discovered_attacks_enhanced(board, prev_board, move))
@@ -282,6 +287,7 @@ class EnhancedTacticsAnalyzer:
             patterns.extend(self._detect_clearance(board, prev_board, move))
             patterns.extend(self._detect_deflection(board, prev_board, move))
             patterns.extend(self._detect_decoy(board, prev_board, move))
+            patterns.extend(self._detect_removal_of_guard(board, prev_board, move))
 
         if self._determine_game_phase(board) == "endgame":
             patterns.extend(self._detect_zugzwang(board))
@@ -292,7 +298,7 @@ class EnhancedTacticsAnalyzer:
             TacticalImpact.MODERATE: 2, TacticalImpact.MINOR: 3
         }.get(p.impact, 4))
 
-        return unique_patterns[:5]
+        return unique_patterns[:6]
 
     def _detect_smothered_mate(self, board: chess.Board) -> Optional[TacticalPattern]:
         checkers = list(board.checkers())
@@ -459,17 +465,31 @@ class EnhancedTacticsAnalyzer:
         patterns = []
         for sq, piece in board.piece_map().items():
             if piece.piece_type == chess.KING: continue
+            forker_val = self.PIECE_VALUES.get(piece.piece_type, 0)
             targets = []
             for t_sq in board.attacks(sq):
                 t_piece = board.piece_at(t_sq)
                 if t_piece and t_piece.color != piece.color:
-                    targets.append({"square": t_sq, "piece": t_piece, "value": self.PIECE_VALUES.get(t_piece.piece_type, 0)})
+                    t_val = self.PIECE_VALUES.get(t_piece.piece_type, 0)
+                    defenders = list(board.attackers(t_piece.color, t_sq))
+                    is_undefended = len(defenders) == 0
+                    is_higher_value = t_val > forker_val
+                    is_king = t_piece.piece_type == chess.KING
+                    # Only count as a genuine fork target if: undefended, higher value, or king
+                    if is_undefended or is_higher_value or is_king:
+                        targets.append({"square": t_sq, "piece": t_piece, "value": t_val, "undefended": is_undefended})
 
             if len(targets) >= 2:
                 targets.sort(key=lambda t: t["value"], reverse=True)
                 top = targets[:2]
+                # Verify genuine material threat: at least one target must be undefended or both must outvalue forker
+                any_undefended = any(t["undefended"] for t in top)
+                both_higher = all(t["value"] > forker_val for t in top)
+                has_king = any(t["piece"].piece_type == chess.KING for t in top)
+                if not (any_undefended or both_higher or has_king):
+                    continue
                 min_val = min(t["value"] for t in top)
-                impact = TacticalImpact.CRITICAL if min_val >= 5 else TacticalImpact.SIGNIFICANT if min_val >= 3 else TacticalImpact.MODERATE
+                impact = TacticalImpact.CRITICAL if has_king or min_val >= 5 else TacticalImpact.SIGNIFICANT if min_val >= 3 else TacticalImpact.MODERATE
                 
                 piece_name = chess.piece_name(piece.piece_type)
                 t_names = [f"{chess.piece_name(t['piece'].piece_type)} on {chess.square_name(t['square'])}" for t in top]
@@ -501,6 +521,23 @@ class EnhancedTacticsAnalyzer:
                 
                 if pinned and target:
                     is_abs = target[1].piece_type == chess.KING
+                    if not is_abs and pinned[1].piece_type == chess.PAWN:
+                        continue
+                    pinned_val = self.PIECE_VALUES.get(pinned[1].piece_type, 0)
+                    pinner_val = self.PIECE_VALUES.get(piece.piece_type, 0)
+                    target_val = self.PIECE_VALUES.get(target[1].piece_type, 0)
+                    # Validate pin is meaningful: absolute pin, or pinned piece is valuable,
+                    # or pinner is worth less than pinned (can win the pinned piece)
+                    if not is_abs:
+                        # For relative pin, check if the pin creates real pressure
+                        # The pin matters if: pinned piece > pinner (can capture profitably)
+                        # or target behind is very valuable (queen/rook)
+                        attackers_on_pinned = len(list(board.attackers(piece.color, pinned[0])))
+                        defenders_of_pinned = len(list(board.attackers(pinned[1].color, pinned[0])))
+                        can_win_pinned = pinner_val <= pinned_val and attackers_on_pinned > defenders_of_pinned
+                        pin_is_meaningful = target_val >= 5.0 or can_win_pinned or pinned_val >= 3.0
+                        if not pin_is_meaningful:
+                            continue
                     narrative = self.TACTICAL_NARRATIVES["pin"]["absolute" if is_abs else "relative"][0].format(piece=chess.piece_name(pinned[1].piece_type), square=chess.square_name(pinned[0]), target=chess.piece_name(target[1].piece_type))
                     patterns.append(TacticalPattern("pin", "Pin", TacticalImpact.CRITICAL if is_abs else TacticalImpact.SIGNIFICANT, [chess.piece_name(piece.piece_type), chess.piece_name(pinned[1].piece_type)], [chess.square_name(sq), chess.square_name(pinned[0])], narrative=narrative, consequences=["Piece is immobilized"]))
         return patterns
@@ -587,52 +624,129 @@ class EnhancedTacticsAnalyzer:
         themes = []
         game_phase = self._determine_game_phase(board)
 
-        # Space Advantage
+        # ---- Pawn Chain Analysis ----
+        for color in [chess.WHITE, chess.BLACK]:
+            color_name = "White" if color else "Black"
+            opp_name = "Black" if color else "White"
+            chains = self._find_pawn_chains(board, color)
+            for chain in chains:
+                if len(chain) >= 3:
+                    head_sq = chain[-1] if color == chess.WHITE else chain[0]
+                    base_sq = chain[0] if color == chess.WHITE else chain[-1]
+                    head_name = chess.square_name(head_sq)
+                    base_name = chess.square_name(base_sq)
+                    chain_names = "-".join(chess.square_name(s) for s in chain)
+                    themes.append(f"{color_name}'s {chain_names} pawn chain cramps {opp_name}'s position; the base on {base_name} is the structural target")
+                elif len(chain) == 2:
+                    chain_names = "-".join(chess.square_name(s) for s in chain)
+                    themes.append(f"{color_name} maintains the {chain_names} pawn chain, controlling key central squares")
+
+        # ---- Pawn Tension / Levers ----
+        levers = self._find_pawn_levers(board)
+        if levers:
+            lev = levers[0]
+            w_name = chess.square_name(lev[0])
+            b_name = chess.square_name(lev[1])
+            themes.append(f"Pawn tension between {w_name} and {b_name} — the decision to capture or advance shapes the middlegame")
+
+        # ---- Space Advantage (improved: based on pawns beyond 4th rank) ----
+        white_advanced = sum(1 for sq in board.pieces(chess.PAWN, chess.WHITE) if chess.square_rank(sq) >= 4)
+        black_advanced = sum(1 for sq in board.pieces(chess.PAWN, chess.BLACK) if chess.square_rank(sq) <= 3)
         white_space = sum(1 for sq in range(32, 64) if board.is_attacked_by(chess.WHITE, sq))
         black_space = sum(1 for sq in range(0, 32) if board.is_attacked_by(chess.BLACK, sq))
-        if white_space > black_space + 12: themes.append("White enjoys a crushing space advantage, cramping Black's pieces")
-        elif black_space > white_space + 12: themes.append("Black enjoys a crushing space advantage, cramping White's pieces")
+        space_diff = (white_space + white_advanced * 3) - (black_space + black_advanced * 3)
+        if space_diff > 15: themes.append("White enjoys a significant space advantage, restricting Black's piece mobility")
+        elif space_diff < -15: themes.append("Black enjoys a significant space advantage, restricting White's piece mobility")
 
-        # Opposite Castling
+        # ---- Opposite Castling ----
         wk = board.king(chess.WHITE)
         bk = board.king(chess.BLACK)
         if wk and bk:
             wk_file, bk_file = chess.square_file(wk), chess.square_file(bk)
             if (wk_file <= 2 and bk_file >= 5) or (wk_file >= 5 and bk_file <= 2):
-                themes.append("Opposite-side castling creates a dangerous race of pawn storms")
+                themes.append("Opposite-side castling creates a dangerous race of pawn storms, where tempo is everything")
 
-        # Endgame King Activity
+        # ---- Bishop Pair ----
+        bp_info = self._detect_bishop_pair(board)
+        if bp_info:
+            themes.append(bp_info)
+
+        # ---- Piece Coordination ----
+        coord_themes = self._detect_piece_coordination(board)
+        themes.extend(coord_themes)
+
+        # ---- Color Complex Weakness ----
+        color_weakness = self._detect_color_complex_weakness(board)
+        if color_weakness:
+            themes.append(color_weakness)
+
+        # ---- Endgame King Activity ----
         if game_phase == "endgame":
             if wk and bk:
                 wk_score = self._centralization_score(wk)
                 bk_score = self._centralization_score(bk)
-                if wk_score > bk_score + 1.5: themes.append("White's king is highly active in the center")
-                elif bk_score > wk_score + 1.5: themes.append("Black's king is highly active in the center")
+                if wk_score > bk_score + 1.5: themes.append("White's king is actively centralized — a crucial endgame advantage")
+                elif bk_score > wk_score + 1.5: themes.append("Black's king is actively centralized — a crucial endgame advantage")
 
-        # Pawn structure & Bad Bishop themes
+        # ---- Pawn structure weaknesses ----
         for color in [chess.WHITE, chess.BLACK]:
             color_name = "White" if color else "Black"
             passed = self._find_passed_pawns(board, color)
-            if passed: themes.append(f"{color_name} has a dangerous passed pawn on {chess.square_name(passed[0])}")
-            
+            if passed:
+                for pp in passed[:2]:
+                    rank = chess.square_rank(pp)
+                    adv_rank = rank if color == chess.WHITE else (7 - rank)
+                    sq_name = chess.square_name(pp)
+                    if adv_rank >= 5:
+                        themes.append(f"{color_name} has a dangerous advanced passed pawn on {sq_name} that demands immediate attention")
+                    else:
+                        themes.append(f"{color_name} has a passed pawn on {sq_name} which could become a long-term asset")
+
             isolated = self._find_isolated_pawns(board, color)
-            if isolated: themes.append(f"{color_name} is burdened with an isolated pawn on {chess.square_name(isolated[0])}")
-            
-            # Corrected Bad Bishop Logic: Only applies out of the opening and if genuinely blocked
+            if isolated:
+                iso_names = ", ".join(chess.square_name(s) for s in isolated[:2])
+                themes.append(f"{color_name} has isolated pawn{'s' if len(isolated) > 1 else ''} on {iso_names} — a static weakness to target")
+
+            hanging = self._find_hanging_pawns(board, color)
+            if hanging:
+                hp_names = ", ".join(chess.square_name(s) for s in hanging[:2])
+                themes.append(f"{color_name} has hanging pawns on {hp_names} — dynamic but potentially vulnerable")
+
+            backward = self._find_backward_pawns(board, color)
+            if backward:
+                themes.append(f"{color_name} has a backward pawn on {chess.square_name(backward[0])} that cannot safely advance")
+
+            # Bad Bishop Logic
             if game_phase != "opening":
                 for sq in board.pieces(chess.BISHOP, color):
                     b_color = self._get_square_color(sq)
                     start_rank = 1 if color == chess.WHITE else 6
                     blocked_pawns = 0
+                    total_own_pawns = len(board.pieces(chess.PAWN, color))
                     for pawn_sq in board.pieces(chess.PAWN, color):
                         if self._get_square_color(pawn_sq) == b_color and chess.square_rank(pawn_sq) != start_rank:
                             blocked_pawns += 1
-                    
-                    if blocked_pawns >= 3 and not self._bishop_has_open_diagonals(board, sq, color):
-                        themes.append(f"{color_name} suffers from a structurally 'Bad Bishop' blocked by its own pawns")
-                        break # Only report once per side
+                    if total_own_pawns >= 4 and blocked_pawns >= 3 and not self._bishop_has_open_diagonals(board, sq, color):
+                        themes.append(f"{color_name}'s bishop on {chess.square_name(sq)} is a 'bad bishop' — hemmed in by its own pawns on the same color")
+                        break
 
-        return themes[:5]
+        # ---- Pawn Breaks ----
+        for color in [chess.WHITE, chess.BLACK]:
+            color_name = "White" if color else "Black"
+            breaks = self._find_pawn_breaks(board, color)
+            if breaks:
+                br = breaks[0]
+                themes.append(f"{color_name} should look for the {chess.square_name(br['to'])} pawn break to open the position")
+
+        # ---- Knight Outposts ----
+        for color in [chess.WHITE, chess.BLACK]:
+            color_name = "White" if color else "Black"
+            for sq in board.pieces(chess.KNIGHT, color):
+                if self._is_good_knight_outpost(board, sq, color):
+                    themes.append(f"{color_name}'s knight on {chess.square_name(sq)} occupies a powerful outpost that cannot be challenged by enemy pawns")
+                    break  # One per side
+
+        return themes[:8]
 
     def _assess_piece_activity(self, board: chess.Board) -> Dict[str, str]:
         activity = {}
@@ -680,14 +794,363 @@ class EnhancedTacticsAnalyzer:
         structure = {"white": {}, "black": {}}
         for color in [chess.WHITE, chess.BLACK]:
             c_name = "white" if color else "black"
+            chains = self._find_pawn_chains(board, color)
+            breaks = self._find_pawn_breaks(board, color)
+            majority = self._find_pawn_majorities(board, color)
             structure[c_name] = {
                 "count": len(board.pieces(chess.PAWN, color)),
                 "passed": [chess.square_name(sq) for sq in self._find_passed_pawns(board, color)],
                 "isolated": [chess.square_name(sq) for sq in self._find_isolated_pawns(board, color)],
                 "doubled": self._count_doubled_pawns(board, color),
                 "backward": [chess.square_name(sq) for sq in self._find_backward_pawns(board, color)],
+                "chains": [["-".join(chess.square_name(s) for s in c)] for c in chains],
+                "hanging": [chess.square_name(sq) for sq in self._find_hanging_pawns(board, color)],
+                "islands": self._count_pawn_islands(board, color),
+                "breaks": [{"from": chess.square_name(b["from"]), "to": chess.square_name(b["to"])} for b in breaks],
+                "majority": majority,
             }
+        structure["levers"] = [(chess.square_name(a), chess.square_name(b)) for a, b in self._find_pawn_levers(board)]
         return structure
+
+    # ==================== PAWN STRUCTURE METHODS ====================
+
+    def _find_pawn_chains(self, board: chess.Board, color: chess.Color) -> List[List[int]]:
+        """Find connected pawn chains. A chain is a diagonal series of pawns defending each other."""
+        pawns = sorted(board.pieces(chess.PAWN, color), key=lambda s: (chess.square_file(s), chess.square_rank(s)))
+        if not pawns:
+            return []
+        visited: Set[int] = set()
+        chains: List[List[int]] = []
+
+        def _trace_chain(sq: int, chain: List[int]) -> None:
+            chain.append(sq)
+            visited.add(sq)
+            f, r = chess.square_file(sq), chess.square_rank(sq)
+            # Look for pawn defending this one from behind (lower rank for white, higher for black)
+            next_rank = r + 1 if color == chess.WHITE else r - 1
+            for nf in [f - 1, f + 1]:
+                if 0 <= nf < 8 and 0 <= next_rank < 8:
+                    ns = chess.square(nf, next_rank)
+                    if ns in pawns and ns not in visited:
+                        p = board.piece_at(ns)
+                        if p and p.piece_type == chess.PAWN and p.color == color:
+                            _trace_chain(ns, chain)
+
+        for sq in pawns:
+            if sq not in visited:
+                chain: List[int] = []
+                _trace_chain(sq, chain)
+                if len(chain) >= 2:
+                    chain.sort(key=lambda s: chess.square_rank(s))
+                    chains.append(chain)
+        return chains
+
+    def _find_pawn_levers(self, board: chess.Board) -> List[Tuple[int, int]]:
+        """Find pawn tension points where White and Black pawns can capture each other."""
+        levers: List[Tuple[int, int]] = []
+        for w_sq in board.pieces(chess.PAWN, chess.WHITE):
+            wf, wr = chess.square_file(w_sq), chess.square_rank(w_sq)
+            for df in [-1, 1]:
+                bf = wf + df
+                br = wr + 1  # Black pawn would be one rank ahead of white
+                if 0 <= bf < 8 and 0 <= br < 8:
+                    b_sq = chess.square(bf, br)
+                    p = board.piece_at(b_sq)
+                    if p and p.piece_type == chess.PAWN and p.color == chess.BLACK:
+                        levers.append((w_sq, b_sq))
+        return levers
+
+    def _find_hanging_pawns(self, board: chess.Board, color: chess.Color) -> List[int]:
+        """Find hanging pawns: two adjacent pawns on a half-open file with no friendly pawn support on adjacent files."""
+        pawn_files = sorted(set(chess.square_file(sq) for sq in board.pieces(chess.PAWN, color)))
+        hanging: List[int] = []
+        for i in range(len(pawn_files) - 1):
+            f1, f2 = pawn_files[i], pawn_files[i + 1]
+            if f2 - f1 != 1:
+                continue  # Not adjacent
+            # Check no friendly pawns on files f1-1 and f2+1
+            outer_files = set()
+            if f1 - 1 >= 0:
+                outer_files.add(f1 - 1)
+            if f2 + 1 < 8:
+                outer_files.add(f2 + 1)
+            has_outer_support = any(
+                chess.square_file(sq) in outer_files
+                for sq in board.pieces(chess.PAWN, color)
+            )
+            if has_outer_support:
+                continue
+            # Check both files are half-open (no enemy pawns blocking)
+            for f in [f1, f2]:
+                for sq in board.pieces(chess.PAWN, color):
+                    if chess.square_file(sq) == f:
+                        enemy_on_file = any(
+                            chess.square_file(es) == f
+                            for es in board.pieces(chess.PAWN, not color)
+                        )
+                        if not enemy_on_file:
+                            hanging.append(sq)
+        return hanging
+
+    def _count_pawn_islands(self, board: chess.Board, color: chess.Color) -> int:
+        """Count pawn islands (groups of connected pawns on adjacent files)."""
+        files = sorted(set(chess.square_file(sq) for sq in board.pieces(chess.PAWN, color)))
+        if not files:
+            return 0
+        islands = 1
+        for i in range(1, len(files)):
+            if files[i] - files[i - 1] > 1:
+                islands += 1
+        return islands
+
+    def _find_pawn_majorities(self, board: chess.Board, color: chess.Color) -> Optional[str]:
+        """Detect queenside or kingside pawn majority."""
+        own_qs = sum(1 for sq in board.pieces(chess.PAWN, color) if chess.square_file(sq) <= 3)
+        own_ks = sum(1 for sq in board.pieces(chess.PAWN, color) if chess.square_file(sq) >= 4)
+        opp_qs = sum(1 for sq in board.pieces(chess.PAWN, not color) if chess.square_file(sq) <= 3)
+        opp_ks = sum(1 for sq in board.pieces(chess.PAWN, not color) if chess.square_file(sq) >= 4)
+        qs_adv = own_qs - opp_qs
+        ks_adv = own_ks - opp_ks
+        if qs_adv >= 2:
+            return "queenside"
+        elif ks_adv >= 2:
+            return "kingside"
+        elif qs_adv == 1 and ks_adv <= 0:
+            return "queenside"
+        elif ks_adv == 1 and qs_adv <= 0:
+            return "kingside"
+        return None
+
+    def _find_pawn_breaks(self, board: chess.Board, color: chess.Color) -> List[Dict[str, int]]:
+        """Identify available pawn breaks (pawn advances that challenge the opponent's structure)."""
+        breaks: List[Dict[str, int]] = []
+        direction = 1 if color == chess.WHITE else -1
+        for sq in board.pieces(chess.PAWN, color):
+            f, r = chess.square_file(sq), chess.square_rank(sq)
+            advance_rank = r + direction
+            if not (0 <= advance_rank < 8):
+                continue
+            advance_sq = chess.square(f, advance_rank)
+            # Check if advance square is blocked
+            if board.piece_at(advance_sq):
+                continue
+            # Check if advancing would challenge an enemy pawn (diagonally adjacent enemy pawn exists)
+            challenges_enemy = False
+            for df in [-1, 1]:
+                check_f = f + df
+                if 0 <= check_f < 8:
+                    adj_sq = chess.square(check_f, advance_rank)
+                    p = board.piece_at(adj_sq)
+                    if p and p.piece_type == chess.PAWN and p.color != color:
+                        challenges_enemy = True
+                        break
+            if challenges_enemy:
+                # Verify the advance is actually a legal move
+                move = chess.Move(sq, advance_sq)
+                if move in board.legal_moves:
+                    breaks.append({"from": sq, "to": advance_sq})
+        return breaks
+
+    # ==================== POSITIONAL DETECTION METHODS ====================
+
+    def _detect_bishop_pair(self, board: chess.Board) -> Optional[str]:
+        """Detect if one side has the bishop pair advantage."""
+        for color in [chess.WHITE, chess.BLACK]:
+            bishops = list(board.pieces(chess.BISHOP, color))
+            opp_bishops = list(board.pieces(chess.BISHOP, not color))
+            if len(bishops) >= 2 and len(opp_bishops) <= 1:
+                color_name = "White" if color else "Black"
+                # Check if position is open enough for bishop pair to matter
+                total_pawns = len(board.pieces(chess.PAWN, chess.WHITE)) + len(board.pieces(chess.PAWN, chess.BLACK))
+                if total_pawns <= 12:
+                    return f"{color_name} has the bishop pair — a significant advantage in this open position"
+                else:
+                    return f"{color_name} has the bishop pair, which could become powerful if the position opens up"
+        return None
+
+    def _detect_piece_coordination(self, board: chess.Board) -> List[str]:
+        """Detect meaningful piece coordination patterns."""
+        themes: List[str] = []
+        for color in [chess.WHITE, chess.BLACK]:
+            color_name = "White" if color else "Black"
+            rooks = list(board.pieces(chess.ROOK, color))
+
+            # Doubled rooks on a file
+            if len(rooks) >= 2:
+                r1f, r2f = chess.square_file(rooks[0]), chess.square_file(rooks[1])
+                if r1f == r2f:
+                    file_letter = chr(ord('a') + r1f)
+                    themes.append(f"{color_name}'s rooks are doubled on the {file_letter}-file, creating heavy pressure")
+
+            # Rook on the 7th rank
+            seventh_rank = 6 if color == chess.WHITE else 1
+            for r_sq in rooks:
+                if chess.square_rank(r_sq) == seventh_rank:
+                    themes.append(f"{color_name}'s rook has invaded the 7th rank — cutting off the king and attacking pawns")
+                    break
+
+            # Queen + Bishop battery on a diagonal
+            queens = list(board.pieces(chess.QUEEN, color))
+            bishops = list(board.pieces(chess.BISHOP, color))
+            if queens and bishops:
+                q_sq = queens[0]
+                for b_sq in bishops:
+                    if self._is_on_diagonal(q_sq, b_sq):
+                        # Check if they're pointing at the enemy king
+                        enemy_king = board.king(not color)
+                        if enemy_king and (self._is_on_diagonal(q_sq, enemy_king) or self._is_on_diagonal(b_sq, enemy_king)):
+                            themes.append(f"{color_name} has a dangerous queen-bishop battery aimed at the enemy king")
+                            break
+
+        return themes[:3]
+
+    def _detect_color_complex_weakness(self, board: chess.Board) -> Optional[str]:
+        """Detect when one side has weak squares of a particular color due to missing bishop."""
+        game_phase = self._determine_game_phase(board)
+        if game_phase == "opening":
+            return None
+        for color in [chess.WHITE, chess.BLACK]:
+            color_name = "White" if color else "Black"
+            bishops = list(board.pieces(chess.BISHOP, color))
+            if len(bishops) != 1:
+                continue  # Need exactly one bishop to have weak color complex
+            b_sq = bishops[0]
+            bishop_sq_color = self._get_square_color(b_sq)  # True = light, False = dark
+            weak_color = not bishop_sq_color  # The color WITHOUT a bishop
+            # Count how many pawns are on the weak color
+            pawns_on_weak = 0
+            for p_sq in board.pieces(chess.PAWN, color):
+                if self._get_square_color(p_sq) == weak_color:
+                    pawns_on_weak += 1
+            # Check if enemy has pieces targeting those squares
+            enemy_pieces_on_weak = 0
+            for p_sq in board.pieces(chess.KNIGHT, not color) | board.pieces(chess.BISHOP, not color):
+                if self._get_square_color(p_sq) == weak_color:
+                    enemy_pieces_on_weak += 1
+            if pawns_on_weak <= 1 and enemy_pieces_on_weak >= 1:
+                sq_color_name = "light" if weak_color else "dark"
+                return f"{color_name}'s {sq_color_name} squares are chronically weak — the missing bishop leaves holes that cannot be covered"
+        return None
+
+    def _detect_trapped_pieces(self, board: chess.Board) -> List[TacticalPattern]:
+        """Detect pieces with very limited mobility that are also under attack."""
+        patterns: List[TacticalPattern] = []
+        for sq, piece in board.piece_map().items():
+            if piece.piece_type in [chess.KING, chess.PAWN]:
+                continue
+            # Count safe squares (squares the piece can move to without being captured)
+            safe_moves = 0
+            piece_val = self.PIECE_VALUES.get(piece.piece_type, 0)
+            for move_sq in board.attacks(sq):
+                target = board.piece_at(move_sq)
+                if target and target.color == piece.color:
+                    continue  # Can't move to friendly piece
+                # Check if the destination is safe
+                enemy_attackers = list(board.attackers(not piece.color, move_sq))
+                if not enemy_attackers:
+                    safe_moves += 1
+                elif target and target.color != piece.color:
+                    # Capture — only safe if captured piece value >= our piece value or dest is safe after
+                    cap_val = self.PIECE_VALUES.get(target.piece_type, 0)
+                    if cap_val >= piece_val:
+                        safe_moves += 1
+            if safe_moves == 0 and piece_val >= 3.0:
+                # Piece is trapped — check if it's actually under threat
+                attackers = list(board.attackers(not piece.color, sq))
+                if attackers:
+                    piece_name = chess.piece_name(piece.piece_type)
+                    sq_name = chess.square_name(sq)
+                    color_name = "White" if piece.color else "Black"
+                    patterns.append(TacticalPattern(
+                        "trapped_piece",
+                        f"Trapped {piece_name}",
+                        TacticalImpact.CRITICAL if piece_val >= 5 else TacticalImpact.SIGNIFICANT,
+                        [piece_name],
+                        [sq_name],
+                        narrative=f"{color_name}'s {piece_name} on {sq_name} is trapped with no safe squares — it will be lost.",
+                        consequences=["Wins material"]
+                    ))
+        return patterns
+
+    def _detect_removal_of_guard(self, board: chess.Board, prev_board: chess.Board, move: chess.Move) -> List[TacticalPattern]:
+        """Detect when a capture removes a key defender, leaving another piece hanging."""
+        patterns: List[TacticalPattern] = []
+        if not prev_board.is_capture(move):
+            return patterns
+        captured_sq = move.to_square
+        captured_piece = prev_board.piece_at(captured_sq)
+        if not captured_piece:
+            return patterns
+        mover_color = prev_board.turn
+        enemy_color = not mover_color
+
+        # Find pieces that the captured piece was defending
+        for defended_sq in prev_board.attacks(captured_sq):
+            defended_piece = prev_board.piece_at(defended_sq)
+            if not defended_piece or defended_piece.color != enemy_color:
+                continue
+            if defended_piece.piece_type == chess.KING:
+                continue
+            # Check if this piece is now hanging after the defender was captured
+            curr_attackers = len(list(board.attackers(mover_color, defended_sq)))
+            curr_defenders = len(list(board.attackers(enemy_color, defended_sq)))
+            prev_defenders = len(list(prev_board.attackers(enemy_color, defended_sq)))
+            if curr_attackers > 0 and curr_attackers > curr_defenders and prev_defenders > curr_defenders:
+                piece_name = chess.piece_name(defended_piece.piece_type)
+                patterns.append(TacticalPattern(
+                    "removal_of_guard",
+                    "Removal of the guard",
+                    TacticalImpact.SIGNIFICANT,
+                    [chess.piece_name(captured_piece.piece_type), piece_name],
+                    [chess.square_name(captured_sq), chess.square_name(defended_sq)],
+                    narrative=f"By capturing the {chess.piece_name(captured_piece.piece_type)} on {chess.square_name(captured_sq)}, the {piece_name} on {chess.square_name(defended_sq)} is left without adequate defense.",
+                    consequences=["Wins material"]
+                ))
+                return patterns  # Report the most important one
+        return patterns
+
+    def _detect_xray_attacks(self, board: chess.Board) -> List[TacticalPattern]:
+        """Detect x-ray attacks where a piece 'sees through' another piece along a line."""
+        patterns: List[TacticalPattern] = []
+        directions = [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]
+        for sq, piece in board.piece_map().items():
+            if piece.piece_type not in [chess.ROOK, chess.BISHOP, chess.QUEEN]:
+                continue
+            for dr, df in directions:
+                if piece.piece_type == chess.ROOK and dr != 0 and df != 0:
+                    continue
+                if piece.piece_type == chess.BISHOP and (dr == 0 or df == 0):
+                    continue
+                # Walk along the direction, looking for: friendly piece -> enemy piece pattern
+                first_piece = None
+                current_sq = sq
+                for _ in range(1, 8):
+                    nf = chess.square_file(current_sq) + df
+                    nr = chess.square_rank(current_sq) + dr
+                    if not (0 <= nf < 8 and 0 <= nr < 8):
+                        break
+                    current_sq = chess.square(nf, nr)
+                    p = board.piece_at(current_sq)
+                    if p:
+                        if not first_piece:
+                            first_piece = (current_sq, p)
+                        else:
+                            # We have two pieces in line
+                            if first_piece[1].color != piece.color and p.color != piece.color:
+                                # X-ray: our piece sees through the first enemy to a second enemy
+                                front_val = self.PIECE_VALUES.get(first_piece[1].piece_type, 0)
+                                back_val = self.PIECE_VALUES.get(p.piece_type, 0)
+                                if back_val >= 3.0:  # Only report if back target is valuable
+                                    patterns.append(TacticalPattern(
+                                        "xray",
+                                        "X-ray attack",
+                                        TacticalImpact.MODERATE,
+                                        [chess.piece_name(piece.piece_type)],
+                                        [chess.square_name(sq), chess.square_name(first_piece[0]), chess.square_name(current_sq)],
+                                        narrative=f"The {chess.piece_name(piece.piece_type)} on {chess.square_name(sq)} x-rays through {chess.square_name(first_piece[0])} to the {chess.piece_name(p.piece_type)} on {chess.square_name(current_sq)}."
+                                    ))
+                            break
+        return patterns[:2]
 
     # ==================== HELPER METHODS ====================
 
@@ -888,14 +1351,28 @@ class EnhancedTacticsAnalyzer:
         return {"is_attacking": False}
 
     def detect_pressure(self, prev_board: chess.Board, curr_board: chess.Board, move: chess.Move) -> Dict[str, Any]:
+        """Report pressure only when attackers outnumber defenders on a defended piece.
+
+        The glossary defines *Pressured* as: an opponent attacks a **defended**
+        piece with **more attackers than defenders**.  The previous version fired
+        whenever a new attacker merely appeared, regardless of defender count,
+        which produced spurious 'keeps pressure on …' commentary even when the
+        target was perfectly safe.
+        """
         if not move: return {"is_pressure": False}
         pressure = []
         for t_sq, t_piece in curr_board.piece_map().items():
             if t_piece.color == prev_board.turn: continue
             prev_att = list(prev_board.attackers(prev_board.turn, t_sq))
             curr_att = list(curr_board.attackers(prev_board.turn, t_sq))
-            if len(curr_att) > len(prev_att):
-                pressure.append({"target_square": chess.square_name(t_sq), "target_piece": chess.piece_name(t_piece.piece_type), "is_pressure": True, "target_value": self.PIECE_VALUES.get(t_piece.piece_type, 0)})
+            # A new attacker must have been added …
+            if len(curr_att) <= len(prev_att):
+                continue
+            # … AND attackers must now outnumber defenders (the glossary definition).
+            curr_def = list(curr_board.attackers(t_piece.color, t_sq))
+            if len(curr_att) <= len(curr_def):
+                continue
+            pressure.append({"target_square": chess.square_name(t_sq), "target_piece": chess.piece_name(t_piece.piece_type), "is_pressure": True, "target_value": self.PIECE_VALUES.get(t_piece.piece_type, 0)})
         if pressure:
             pressure.sort(key=lambda x: x["target_value"], reverse=True)
             return pressure[0]
@@ -934,11 +1411,18 @@ class EnhancedTacticsAnalyzer:
         cap_val = self.PIECE_VALUES.get(captured_piece.piece_type, 0)
         atk_val = self.PIECE_VALUES.get(capturing_piece.piece_type, 0)
         can_recapture = len(list(curr_board.attackers(not capturing_piece.color, move.to_square))) > 0
-        
-        if not can_recapture: return {"type": "free_capture", "target": chess.piece_name(captured_piece.piece_type)}
-        elif cap_val > atk_val: return {"type": "favorable_trade", "target": chess.piece_name(captured_piece.piece_type)}
-        elif cap_val == atk_val: return {"type": "equal_trade", "target": chess.piece_name(captured_piece.piece_type), "attacker": chess.piece_name(capturing_piece.piece_type)}
-        else: return {"type": "sacrifice", "target": chess.piece_name(captured_piece.piece_type)}
+
+        target_name = chess.piece_name(captured_piece.piece_type)
+        attacker_name = chess.piece_name(capturing_piece.piece_type)
+        if captured_piece.piece_type == chess.QUEEN or (cap_val - atk_val) >= 3.5:
+            return {"type": "winning_capture", "target": target_name, "attacker": attacker_name}
+        if not can_recapture:
+            return {"type": "free_capture", "target": target_name, "attacker": attacker_name}
+        if cap_val > atk_val:
+            return {"type": "favorable_trade", "target": target_name, "attacker": attacker_name}
+        if cap_val == atk_val:
+            return {"type": "equal_trade", "target": target_name, "attacker": attacker_name}
+        return {"type": "sacrifice", "target": target_name, "attacker": attacker_name}
 
     def detect_resolved_threats(self, prev_board: chess.Board, curr_board: chess.Board, move: chess.Move) -> List[str]:
         mover_color = prev_board.turn
@@ -971,6 +1455,33 @@ class EnhancedTacticsAnalyzer:
                         saved_pieces.append(chess.piece_name(piece.piece_type))
         return list(set(saved_pieces))
 
+    def _is_meaningfully_attacked(
+        self,
+        board: chess.Board,
+        square: int,
+        piece: chess.Piece,
+        enemy_color: chess.Color,
+    ) -> bool:
+        attackers = list(board.attackers(enemy_color, square))
+        if not attackers:
+            return False
+
+        defenders = list(board.attackers(piece.color, square))
+        if len(attackers) == 1 and board.piece_at(attackers[0]).piece_type == chess.KING and defenders:
+            return False
+
+        piece_val = self.PIECE_VALUES.get(piece.piece_type, 0)
+        lowest_attacker = min(
+            (board.piece_at(sq) for sq in attackers if board.piece_at(sq)),
+            key=lambda p: self.PIECE_VALUES.get(p.piece_type, 0),
+            default=None,
+        )
+        if lowest_attacker is None:
+            return False
+
+        lowest_attacker_val = self.PIECE_VALUES.get(lowest_attacker.piece_type, 0)
+        return len(attackers) > len(defenders) or lowest_attacker_val < piece_val
+
     def detect_hung_piece(self, prev_board: chess.Board, curr_board: chess.Board, move: chess.Move) -> Optional[Dict[str, str]]:
         if not move: return None
         mover_color = prev_board.turn
@@ -981,17 +1492,30 @@ class EnhancedTacticsAnalyzer:
             mov_piece = prev_board.piece_at(move.from_square)
             if cap_piece and mov_piece and self.PIECE_VALUES.get(cap_piece.piece_type, 0) >= self.PIECE_VALUES.get(mov_piece.piece_type, 0):
                 return None
-        
+
+        candidates: List[Tuple[float, Dict[str, str]]] = []
         for sq, piece in curr_board.piece_map().items():
             if piece.color != mover_color or piece.piece_type in [chess.KING, chess.PAWN]: continue 
-            
-            safe_before = len(list(prev_board.attackers(enemy_color, sq))) <= len(list(prev_board.attackers(mover_color, sq)))
-            curr_att = list(curr_board.attackers(enemy_color, sq))
-            curr_def = list(curr_board.attackers(mover_color, sq))
-            
-            if len(curr_att) == 1 and curr_board.piece_at(curr_att[0]).piece_type == chess.KING and len(curr_def) > 0: continue
-                
-            hanging_now = len(curr_att) > len(curr_def)
-            if safe_before and hanging_now:
-                return {"piece": chess.piece_name(piece.piece_type)}
-        return None
+
+            safe_before = not self._is_meaningfully_attacked(prev_board, sq, piece, enemy_color)
+            hanging_now = self._is_meaningfully_attacked(curr_board, sq, piece, enemy_color)
+            if not (safe_before and hanging_now):
+                continue
+
+            attackers = list(curr_board.attackers(enemy_color, sq))
+            defenders = list(curr_board.attackers(mover_color, sq))
+            score = self.PIECE_VALUES.get(piece.piece_type, 0) * 10 + max(0, len(attackers) - len(defenders))
+            candidates.append(
+                (
+                    score,
+                    {
+                        "piece": chess.piece_name(piece.piece_type),
+                        "square": chess.square_name(sq),
+                    },
+                )
+            )
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]

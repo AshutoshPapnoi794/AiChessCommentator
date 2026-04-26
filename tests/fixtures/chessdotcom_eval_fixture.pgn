@@ -1,0 +1,13 @@
+[Event "Chess.com Fixture"]
+[Site "?"]
+[Date "2026.04.23"]
+[Round "?"]
+[White "Alpha"]
+[Black "Beta"]
+[Result "*"]
+[Opening "Ruy Lopez"]
+
+1. e4 {White puts a pawn in the center.} e5 {Black answers in kind.}
+2. Nf3 {Developing with tempo against e5.} Nc6 {Black supports the pawn and develops.}
+3. Bb5 {This move pins the c6 knight to the king.} a6 {Black chases the bishop and gains space.}
+4. Bxc6 {White trades on c6 to mess up the pawns.} dxc6 {Black takes back and lives with doubled pawns.} *

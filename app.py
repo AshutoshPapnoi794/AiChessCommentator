@@ -29,6 +29,13 @@ from flask import Flask, abort, render_template, request
 from flask_socketio import SocketIO
 from stockfish import Stockfish
 
+from commentary_logic import (
+    CommentaryBlueprint,
+    blueprint_from_payload,
+    build_commentary_blueprint,
+    render_blueprint_draft,
+)
+from structured_commentary import build_structured_commentary
 from tactics_analyzer import EnhancedTacticsAnalyzer
 
 try:
@@ -139,8 +146,11 @@ if os.getenv("GEMINI_TEXT_API_KEY") and genai_text_model is not None:
 tts_model = None
 tts_lock = threading.Lock()
 TTS_VOICE = "Bruno"  # You can change to any valid KittenTTS voice
+DISABLE_KITTENTTS = os.getenv("DISABLE_KITTENTTS", "").strip().lower() in {"1", "true", "yes"}
 
-if KittenTTS is not None:
+if DISABLE_KITTENTTS:
+    logger.info("KittenTTS disabled via DISABLE_KITTENTTS.")
+elif KittenTTS is not None:
     try:
         logger.info("Loading KittenTTS model...")
         tts_model = KittenTTS("KittenML/kitten-tts-nano-0.8-int8")
@@ -167,6 +177,10 @@ analysis_queues: Dict[str, "queue.Queue"] = {}
 worker_threads: Dict[str, threading.Thread] = {}
 commentary_engines: Dict[str, Stockfish] = {}
 commentary_locks: Dict[str, threading.Lock] = {}
+# Stores the last CommentaryBlueprint dict per session so the real-time
+# handler can pass previous_blueprint to build_rich_context, matching the
+# behaviour of the batch prefetch handler.
+_session_blueprints: Dict[str, Optional[Dict[str, Any]]] = {}
 
 
 # ==================== UTILITY FUNCTIONS ====================
@@ -303,13 +317,78 @@ def sanitize_sentence(text: Any) -> str:
     return " ".join(cleaned_lines)
 
 
+def _normalize_commentary_block(text: Any) -> str:
+    raw_lines = [line.rstrip() for line in str(text or "").splitlines()]
+    cleaned_lines: List[str] = []
+    blank_streak = 0
+    for raw in raw_lines:
+        line = re.sub(r"\s+", " ", raw).strip()
+        if not line:
+            blank_streak += 1
+            if blank_streak <= 1:
+                cleaned_lines.append("")
+            continue
+        blank_streak = 0
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
+
+
 def is_low_quality_commentary(text: str) -> bool:
     line = (text or "").strip().lower()
     if not line: return True
     banned_phrases = ["move quality tag", "story thread", "opening info", "practical choice", "no hallucinations", "no move trees"]
     if any(p in line for p in banned_phrases): return True
+    generic_patterns = [
+        r"after this move,\s+(white|black)\s+keeps?\s+(a\s+)?(slight|clear)\s+edge",
+        r"after this move,\s+the position stays roughly balanced",
+        r"\b(white|black)\s+keeps?\s+(a\s+)?(slight|clear)\s+edge\b",
+        r"\b(white|black)\s+has\s+a\s+near-winning\s+advantage\b",
+        r"\bthe position stays roughly balanced\b",
+        r"^(white|black)\s+(plays|moves)\s+[a-z0-9=+#-]+[.?!]?\s+after this move,",
+    ]
+    if any(re.search(pattern, line) for pattern in generic_patterns): return True
     if re.fullmatch(r"(white|black)\s+(plays|moves)\s+[a-z0-9=+#-]+[.?!]?", line): return True
-    return len(line.split()) < 7
+    generic_eval_phrases = ["slight edge", "clear edge", "near-winning advantage", "roughly balanced", "after this move"]
+    if any(phrase in line for phrase in generic_eval_phrases):
+        concept_hits = sum(1 for token in ["center", "central", "develop", "bishop", "knight", "rook", "queen", "king", "pawn", "file", "diagonal", "fork", "pin", "trade", "threat", "castle", "initiative", "d4", "d5", "e4", "e5"] if token in line)
+        if concept_hits < 2: return True
+    return len(line.split()) < 8
+
+
+def _normalized_words(text: str) -> List[str]:
+    return re.findall(r"[a-z0-9+#=-]+", str(text or "").lower())
+
+
+def _rewrite_keyword_hit_count(text: str, keywords: List[str]) -> int:
+    normalized = str(text or "").lower()
+    tokens = set(_normalized_words(normalized))
+    hits = 0
+    for keyword in keywords:
+        key = str(keyword or "").strip().lower()
+        if not key:
+            continue
+        key_tokens = [tok for tok in re.findall(r"[a-z0-9+#=-]+", key) if tok]
+        if not key_tokens:
+            continue
+        if len(key_tokens) == 1:
+            if key in normalized or key_tokens[0] in tokens:
+                hits += 1
+        elif all(token in normalized or token in tokens for token in key_tokens):
+            hits += 1
+    return hits
+
+
+def _rewrite_preserves_blueprint(candidate: str, context: Dict[str, Any]) -> bool:
+    blueprint = context.get("blueprint") or {}
+    draft = str(context.get("draft_commentary", "") or "")
+    if not candidate or is_low_quality_commentary(candidate): return False
+    draft_words, candidate_words = len(_normalized_words(draft)), len(_normalized_words(candidate))
+    if candidate_words < max(9, int(draft_words * 0.8)): return False
+
+    keywords = [str(item) for item in blueprint.get("keywords", []) if item]
+    if not keywords: return True
+    required_hits = min(2, len(keywords))
+    return _rewrite_keyword_hit_count(candidate, keywords) >= required_hits
 
 
 def _color_name(color: chess.Color) -> str:
@@ -471,18 +550,33 @@ def analyze_best_move_tactics(
 
     tactical_patterns = analysis.get("tactical_patterns", [])
     
+    # Discovered-attack detection: a slider that was NOT already attacking the
+    # valuable target before the move (i.e. the attack was "uncovered" by the
+    # best move clearing the line).  The old code checked only the post-move
+    # board so every pre-existing slider attack was a false positive.
     discovered_attack, discovered_target = False, None
     for attacker_sq in board_after.pieces(chess.QUEEN, board.turn) | board_after.pieces(chess.ROOK, board.turn) | board_after.pieces(chess.BISHOP, board.turn):
-        if attacker_sq == best_move.to_square: continue
+        if attacker_sq == best_move.to_square:
+            continue  # The moved piece itself is not a discovered attacker
+        if attacker_sq == best_move.from_square:
+            continue  # Piece left this square; skip ghost reference
         attacker = board_after.piece_at(attacker_sq)
-        if not attacker: continue
+        if not attacker:
+            continue
         for target_sq in board_after.attacks(attacker_sq):
             target = board_after.piece_at(target_sq)
-            if target and target.color != board.turn and target.piece_type in [chess.KING, chess.QUEEN, chess.ROOK]:
+            if not target or target.color == board.turn:
+                continue
+            if target.piece_type not in (chess.KING, chess.QUEEN, chess.ROOK):
+                continue
+            # Only flag as DISCOVERED if the slider did NOT already attack this
+            # square before the best move was played.
+            if target_sq not in board.attacks(attacker_sq):
                 discovered_attack = True
                 discovered_target = chess.piece_name(target.piece_type)
                 break
-        if discovered_attack: break
+        if discovered_attack:
+            break
 
     attacks_valuable, attacked_piece = False, None
     for target_sq in board_after.attacks(best_move.to_square):
@@ -567,11 +661,19 @@ def get_attackers(board: chess.Board, square: int, by_color: chess.Color) -> Lis
     return [f"{chess.piece_name(board.piece_at(a).piece_type)} on {chess.square_name(a)}" for a in board.attackers(by_color, square) if board.piece_at(a)][:6]
 
 
-def build_verified_facts(prev_board: chess.Board, curr_board: chess.Board, move: Optional[chess.Move]) -> Dict[str, Any]:
+def build_verified_facts(
+    prev_board: chess.Board,
+    curr_board: chess.Board,
+    move: Optional[chess.Move],
+    previous_move: Optional[chess.Move] = None,
+) -> Dict[str, Any]:
     facts = {
         "move_from": None, "move_to": None, "moving_piece": None, "captures": None,
         "attacks_enemy_pieces": [], "defends_friendly_pieces": [], "attackers_of_dest": [],
-        "defenders_of_dest": [], "gives_check": None, "gives_checkmate": False, "is_developing_piece": False, "central_control": []
+        "defenders_of_dest": [], "gives_check": None, "gives_checkmate": False,
+        "is_developing_piece": False, "develops_minor_piece": False, "castling_side": None,
+        "central_control": [], "central_support": [], "central_pressure": [],
+        "is_fianchetto_prep": False, "is_recapture": False,
     }
     if not move: return facts
 
@@ -602,15 +704,47 @@ def build_verified_facts(prev_board: chess.Board, curr_board: chess.Board, move:
         if checkers:
             c_piece = curr_board.piece_at(checkers[0])
             if c_piece: facts["gives_check"] = f"{chess.piece_name(c_piece.piece_type)} from {chess.square_name(checkers[0])}"
-    
+
     facts["gives_checkmate"] = curr_board.is_checkmate()
+    if prev_board.is_castling(move):
+        facts["castling_side"] = "queenside" if chess.square_file(move.to_square) < chess.square_file(move.from_square) else "kingside"
 
     if moving_piece and moving_piece.piece_type in [chess.KNIGHT, chess.BISHOP]:
         from_rank = chess.square_rank(move.from_square)
         if (prev_board.turn == chess.WHITE and from_rank == 0) or (prev_board.turn == chess.BLACK and from_rank == 7):
             facts["is_developing_piece"] = True
+            facts["develops_minor_piece"] = True
 
-    facts["central_control"] = [chess.square_name(sq) for sq in [chess.D4, chess.D5, chess.E4, chess.E5] if sq in curr_board.attacks(move.to_square)]
+    if moving_piece and moving_piece.piece_type == chess.PAWN:
+        bishop_square = {
+            chess.WHITE: {chess.G3: chess.F1, chess.B3: chess.C1},
+            chess.BLACK: {chess.G6: chess.F8, chess.B6: chess.C8},
+        }.get(moving_piece.color, {}).get(move.to_square)
+        bishop = curr_board.piece_at(bishop_square) if bishop_square is not None else None
+        if bishop and bishop.color == moving_piece.color and bishop.piece_type == chess.BISHOP:
+            facts["is_fianchetto_prep"] = True
+
+    if previous_move and prev_board.is_capture(move):
+        facts["is_recapture"] = move.to_square == previous_move.to_square
+
+    central_control = []
+    central_support = []
+    central_pressure = []
+    for sq in [chess.D4, chess.D5, chess.E4, chess.E5]:
+        if sq not in curr_board.attacks(move.to_square):
+            continue
+        sq_name = chess.square_name(sq)
+        occupant = curr_board.piece_at(sq)
+        if occupant and occupant.color == prev_board.turn:
+            central_support.append(sq_name)
+        elif occupant and occupant.color != prev_board.turn:
+            central_pressure.append(sq_name)
+        else:
+            central_control.append(sq_name)
+
+    facts["central_control"] = central_control
+    facts["central_support"] = central_support
+    facts["central_pressure"] = central_pressure
 
     return facts
 
@@ -626,9 +760,12 @@ def build_rich_context(
     opening_name: str,
     missed_tactics: Optional[Dict[str, Any]] = None,
     tactics_enabled: bool = DEFAULT_TACTICS_ENABLED,
+    previous_move: Optional[chess.Move] = None,
+    previous_blueprint: Optional[Dict[str, Any]] = None,
+    sid: str = "",
 ) -> Dict[str, Any]:
     mover = prev_board.turn
-    verified_facts = build_verified_facts(prev_board, curr_board, move)
+    verified_facts = build_verified_facts(prev_board, curr_board, move, previous_move=previous_move)
 
     move_info = {
         "san": move_san,
@@ -650,115 +787,172 @@ def build_rich_context(
     hung_piece_info = tactics_analyzer.detect_hung_piece(prev_board, curr_board, move) if tactics_enabled and move else None
 
     tactical_patterns = analysis_after.get("tactical_patterns", [])
+    
+    primary_tactic = None
+    if tactical_patterns and move:
+        move_squares = {chess.square_name(move.from_square), chess.square_name(move.to_square)}
+        active_types = {"fork", "discovered_attack", "double_check", "removal_of_guard"}
+        
+        # 1. Direct involvement (highest priority)
+        direct_tactics = [t for t in tactical_patterns if any(sq in move_squares for sq in t.get("squares", []))]
+        
+        # 2. Active tactics (even if square matching fails)
+        active_tactics = [t for t in tactical_patterns if t.get("type") in active_types]
+        
+        if direct_tactics:
+            primary_tactic = direct_tactics[0]
+        elif active_tactics:
+            primary_tactic = active_tactics[0]
+        else:
+            # If it's a passive pattern (pin/xray) and doesn't involve the moved piece, drop it
+            pass
 
-    return {
+    quality = classify_move_quality(cp_before, cp_after, mover == chess.WHITE)
+    tactical_context = {
+        "has_tactics": bool(tactical_patterns),
+        "primary_tactic": primary_tactic,
+        "strategic_themes": analysis_after.get("strategic_themes", []),
+        "attack_info": analysis_after.get("attack_info", {}),
+        "pressure_info": analysis_after.get("pressure_info", {}),
+        "is_brilliant": analysis_after.get("is_brilliant", False),
+        "brilliant_details": analysis_after.get("brilliant_details", {}),
+        "capture_analysis": capture_analysis,
+        "resolved_threats": resolved_threats,
+        "hung_piece": hung_piece_info,
+    }
+
+    context = {
         "move": move_info,
         "eval": eval_info,
-        "quality": classify_move_quality(cp_before, cp_after, mover == chess.WHITE),
-        "tactical": {
-            "has_tactics": bool(tactical_patterns),
-            "primary_tactic": tactical_patterns[0] if tactical_patterns else None,
+        "quality": quality,
+        "tactical": tactical_context,
+        "analysis": {
+            "side_to_move": "white" if curr_board.turn == chess.WHITE else "black",
+            "game_phase": analysis_after.get("game_phase"),
+            "king_safety": analysis_after.get("king_safety", {}),
+            "piece_activity": analysis_after.get("piece_activity", {}),
+            "pawn_structure": analysis_after.get("pawn_structure", {}),
+            "weak_squares": analysis_after.get("weak_squares", {}),
+            "threats": analysis_after.get("threats", []),
             "strategic_themes": analysis_after.get("strategic_themes", []),
-            "attack_info": analysis_after.get("attack_info", {}),
-            "pressure_info": analysis_after.get("pressure_info", {}),
-            "is_brilliant": analysis_after.get("is_brilliant", False),
-            "brilliant_details": analysis_after.get("brilliant_details", {}),
-            "capture_analysis": capture_analysis,
-            "resolved_threats": resolved_threats,
-            "hung_piece": hung_piece_info,
+            "tactical_patterns": tactical_patterns,
         },
         "opening_name": opening_name,
         "ply": curr_board.ply(),
         "missed_tactics": missed_tactics or {},
         "verified_facts": verified_facts,
+        "previous_move": _serialize_move(prev_board, previous_move) if previous_move else {},
+    }
+
+    parsed_previous_blueprint = previous_blueprint if isinstance(previous_blueprint, CommentaryBlueprint) else blueprint_from_payload(previous_blueprint)
+    commentary_blueprint = build_commentary_blueprint(
+        prev_board=prev_board,
+        curr_board=curr_board,
+        move=move,
+        context=context,
+        previous_blueprint=parsed_previous_blueprint,
+    )
+    context["commentary_blueprint"] = commentary_blueprint.to_dict()
+    context["blueprint"] = commentary_blueprint.to_dict()
+    context["draft_commentary"] = commentary_blueprint.draft or render_blueprint_draft(commentary_blueprint)
+    engine_info = _build_engine_commentary_info(
+        sid=sid,
+        prev_board=prev_board,
+        curr_board=curr_board,
+        move=move,
+        quality=quality,
+    )
+    context["engine_info"] = engine_info
+    context["structured_commentary"] = build_structured_commentary(
+        prev_board=prev_board,
+        curr_board=curr_board,
+        move=move,
+        context=context,
+        engine_info=engine_info,
+    )
+    return context
+
+
+def _build_engine_commentary_info(
+    sid: str,
+    prev_board: chess.Board,
+    curr_board: chess.Board,
+    move: Optional[chess.Move],
+    quality: str,
+) -> Dict[str, Any]:
+    if not sid or not STOCKFISH_PATH:
+        return {}
+
+    info: Dict[str, Any] = {}
+    best_line_after = get_best_line_san(sid, curr_board, max_plies=4)
+    if best_line_after:
+        info["best_line_after"] = best_line_after
+        info["best_move_after"] = best_line_after.split()[0]
+
+    if move and quality != "best":
+        best_line_before = get_best_line_san(sid, prev_board, max_plies=4)
+        if best_line_before:
+            info["best_line_before"] = best_line_before
+            info["best_move_before"] = best_line_before.split()[0]
+
+    return info
+
+
+def _serialize_move(board: chess.Board, move: chess.Move) -> Dict[str, Any]:
+    piece = board.piece_at(move.from_square)
+    return {
+        "san": board.san(move) if move in board.legal_moves else move.uci(),
+        "uci": move.uci(),
+        "piece": chess.piece_name(piece.piece_type) if piece else "",
+        "from_square": chess.square_name(move.from_square),
+        "to_square": chess.square_name(move.to_square),
+        "mover": _color_name(board.turn),
     }
 
 
 def generate_commentary_prompt(context: Dict[str, Any]) -> str:
     move = context["move"]
-    eval_info = context["eval"]
-    quality = context["quality"]
-    tactical = context.get("tactical", {})
-    verified = context.get("verified_facts", {})
+    blueprint = context.get("blueprint") or context.get("commentary_blueprint") or {}
+    draft = str(context.get("draft_commentary", "") or "")
+    locked_keywords = ", ".join(str(item) for item in blueprint.get("keywords", []) if item) or "none"
+    sentence_limit = max(2, len([part for part in re.split(r"[.!?]+", draft) if part.strip()]))
+    lines = [
+        "You are editing chess commentary, not analyzing the move.",
+        "The chess understanding is already done by the program.",
+        "Rewrite the verified draft below so it sounds natural and polished, but do not add new ideas.",
+        "",
+        f"MOVE: {move['mover']} played {move['san']}",
+        f"DRAFT: {draft}",
+        f"LEAD: {blueprint.get('lead', '')}",
+    ]
+    if support := blueprint.get("support", ""):
+        lines.append(f"SUPPORT: {support}")
+    if verdict := blueprint.get("verdict", ""):
+        lines.append(f"VERDICT: {verdict}")
+    lines.append(f"KEYWORDS: {locked_keywords}")
 
-    lines = [f"MOVE: {move['mover']} plays {move['san']}"]
-
-    if tactical.get("is_brilliant"):
-        lines.append("BRILLIANT: This is a brilliant sacrifice!")
-        if comp := tactical.get("brilliant_details", {}).get("compensation"): lines.append(f"COMPENSATION: {comp}")
-
-    hung = tactical.get("hung_piece")
-    if hung and quality in ["blunder", "mistake"]:
-        lines.append(f"BLUNDER: This move removes the defender and hangs the {hung['piece']}!")
-
-    capture_info = tactical.get("capture_analysis", {})
-    if capture_info:
-        c_type = capture_info.get("type")
-        target = capture_info.get("target", "piece")
-        if c_type == "equal_trade": lines.append(f"EQUAL TRADE: Trades the {capture_info.get('attacker', 'piece')} for the {target}.")
-        elif c_type == "free_capture": lines.append(f"WINS MATERIAL: Captures the undefended {target} for free!")
-        elif c_type == "favorable_trade": lines.append(f"WINS MATERIAL: Wins the more valuable {target}.")
-        elif c_type == "sacrifice": lines.append(f"SACRIFICE: Sacrifices material to take the {target}.")
-    elif verified.get("captures"):
-        lines.append(f"CAPTURES: Takes the {verified['captures']}.")
-
-    attack_info = tactical.get("attack_info", {})
-    if attack_info.get("is_attacking"):
-        a_type = attack_info.get("attack_type")
-        attacker = attack_info.get("attacker_piece", "piece")
-        target = attack_info.get("target_piece", "piece")
-        
-        if attacker != move["piece"] and verified.get("gives_check"):
-            lines.append(f"ZWISCHENZUG: Plays an in-between check while the {attacker} threatens the {target}.")
-        elif attacker != move["piece"]:
-            lines.append(f"THREAT: Meanwhile, the {attacker} is threatening the {target}.")
-        elif a_type == "trade_offer": lines.append(f"TRADE OFFER: Challenges the {target} with the {attacker}.")
-        elif a_type == "favorable_trade": lines.append(f"FAVORABLE ATTACK: The {attacker} attacks the more valuable {target}.")
-        else: lines.append(f"THREAT: Creates a direct threat against the undefended {target}.")
-
-    resolved = tactical.get("resolved_threats", [])
-    if resolved: lines.append(f"DEFENSE: Successfully defends the {resolved[0]} which was previously under attack.")
-
-    if verified.get("gives_checkmate"): lines.append("CHECKMATE!")
-    elif verified.get("gives_check"): lines.append(f"GIVES CHECK: {verified['gives_check']}")
-
-    if verified.get("is_developing_piece"): lines.append("DEVELOPMENT: Improving a piece off the back rank")
-
-    if themes := tactical.get("strategic_themes", []):
-        lines.append(f"STRATEGY: {themes[0]}")
-
-    lines.append(f"EVALUATION: {eval_info['formatted_after']}")
-    if eval_info["is_turning_point"]:
-        swing = abs(eval_info["swing"]) / 100
-        lines.append(f"SWING: {'Better' if eval_info['swing'] > 0 else 'Worse'} for {move['mover']} ({'+' if eval_info['swing'] > 0 else '-'}{swing:.1f} pawns)")
-
-    if missed_tactics := context.get("missed_tactics", {}):
-        if best_move := missed_tactics.get("missed_best_move", ""):
-            lines.append(f"MISSED: {best_move} was better!")
-
-    prompt = f"""You are a chess grandmaster commentator. Write 1-2 sentences of insightful, natural commentary.
-
-{chr(10).join(lines)}
+    prompt = f"""{chr(10).join(lines)}
 
 RULES:
-- Be CONVERSATIONAL and insightful, not robotic
-- If there's an EQUAL TRADE or TRADE OFFER, mention the simplification/challenge
-- If ZWISCHENZUG, praise the in-between move
-- If BLUNDER/hangs piece, explicitly state what they blundered
-- Use ACTIVE voice
-- NEVER invent or hallucinate piece locations, defenders, or attackers. Only state facts exactly as provided above.
-- 1-2 sentences maximum
+- Rewrite only. Do not do fresh chess analysis.
+- Keep the same meaning as the draft and preserve the locked keywords.
+- Do not add any new move, square, line, attacker, defender, or evaluation claim.
+- Keep at least as much concrete detail as the draft.
+- Use active, human-sounding prose.
+- No more than {sentence_limit} sentences.
 
 Commentary:"""
     return prompt
 
 
 def generate_gemini_commentary(*, context: Dict[str, Any]) -> str:
+    if structured := _normalize_commentary_block(context.get("structured_commentary", "")):
+        return structured
     if not text_model: return ""
     try:
         resp = text_model.generate_content(generate_commentary_prompt(context))
         line = sanitize_sentence(getattr(resp, "text", "") or "")
-        return "" if is_low_quality_commentary(line) else line
+        return line if _rewrite_preserves_blueprint(line, context) else ""
     except Exception as exc:
         logger.debug("Gemini commentary generation failed: %s", exc)
         return ""
@@ -824,103 +1018,61 @@ def emit_commentary_audio_for_room(sid: str, ply: int, commentary: Any) -> None:
     socketio.emit("ai_commentary_audio_result", {"ply": ply, "audio_data": payload["audio_data"], "audio_mime_type": payload["audio_mime_type"]}, room=sid)
 
 
-def _evaluation_story(cp: int) -> str:
-    abs_cp = abs(cp)
-    if abs_cp < 30: return "the position stays roughly balanced"
-    if cp > 0:
-        if abs_cp < 120: return "White keeps a slight edge"
-        if abs_cp < 300: return "White keeps a clear edge"
-        return "White has a near-winning advantage"
-    if abs_cp < 120: return "Black keeps a slight edge"
-    if abs_cp < 300: return "Black keeps a clear edge"
-    return "Black has a near-winning advantage"
-
-
-def _sentence_case(text: str) -> str: return text[0].upper() + text[1:] if text else text
-
-
 def generate_fallback_commentary(context: Dict[str, Any]) -> str:
-    move, tactical, verified = context["move"], context.get("tactical", {}), context.get("verified_facts", {})
-    sentences = []
-
-    if tactical.get("is_brilliant"):
-        sentences.append(f"Brilliant sacrifice! {move['mover']} offers the {tactical['brilliant_details'].get('sacrificed_piece', 'piece')} for free.")
-    elif hung := tactical.get("hung_piece"):
-        if context.get("quality") in ["blunder", "mistake"]:
-            sentences.append(f"A terrible mistake. {move['mover']} leaves the {hung['piece']} completely defenseless.")
-        else:
-            sentences.append(f"{move['mover']} plays {move['san']}.")
-    elif verified.get("gives_checkmate"): sentences.append(f"Checkmate! {move['mover']} wins!")
-    elif move["is_castling"]: sentences.append(f"{move['mover']} castles {move.get('castling_side', 'kingside')}.")
-    else: sentences.append(f"{move['mover']} plays {move['san']}.")
-
-    attack_info = tactical.get("attack_info", {})
-    if attack_info.get("is_attacking"):
-        a_type = attack_info.get("attack_type")
-        target = attack_info.get("target_piece", "piece")
-        if a_type == "trade_offer": sentences.append(f"It proposes a trade for the {target}.")
-        else: sentences.append(f"It creates a concrete threat against the {target}.")
-
-    if not attack_info.get("is_attacking") and len(sentences) == 1:
-        cp_after = context.get("eval", {}).get("cp_after")
-        if isinstance(cp_after, (int, float)): sentences.append(f"After this move, {_evaluation_story(int(cp_after))}.")
-
-    return sanitize_sentence(" ".join(sentences[:3]))
+    if structured := _normalize_commentary_block(context.get("structured_commentary", "")):
+        return structured
+    if draft := str(context.get("draft_commentary", "") or ""):
+        return sanitize_sentence(draft)
+    blueprint = blueprint_from_payload(context.get("blueprint") or context.get("commentary_blueprint"))
+    if blueprint:
+        return sanitize_sentence(render_blueprint_draft(blueprint))
+    move = context["move"]
+    return sanitize_sentence(f"{move['mover']} plays {move['san']} and improves the position.")
 
 
 def generate_batch_gemini_commentary(contexts: List[Dict[str, Any]], chunk_size: int = 20) -> Dict[int, str]:
+    structured = {
+        int(ctx["ply"]): _normalize_commentary_block(ctx.get("structured_commentary", ""))
+        for ctx in contexts
+        if ctx.get("ply") and _normalize_commentary_block(ctx.get("structured_commentary", ""))
+    }
+    if structured:
+        return structured
     if not text_model or not contexts: return {}
     by_ply = {}
 
     for start in range(0, len(contexts), chunk_size):
         chunk = contexts[start : start + chunk_size]
         context_lines = []
+        context_by_ply = {}
         for ctx in chunk:
-            move, tactical, verified = ctx["move"], ctx.get("tactical", {}), ctx.get("verified_facts", {})
-            line_parts = [f"ply={ctx['ply']}", f"move={move['san']}", f"mover={move['mover']}"]
-
-            if tactical.get("is_brilliant"): line_parts.append("brilliant=true")
-            
-            if hung := tactical.get("hung_piece"): 
-                if ctx.get("quality") in ["blunder", "mistake"]:
-                    line_parts.append(f"hangs={hung['piece']}")
-            
-            if capture_info := tactical.get("capture_analysis"):
-                if capture_info.get("type") == "equal_trade": line_parts.append(f"trades_for={capture_info.get('target')}")
-                elif capture_info.get("type") in ["free_capture", "favorable_trade"]: line_parts.append(f"wins_material={capture_info.get('target')}")
-            
-            if resolved := tactical.get("resolved_threats"): line_parts.append(f"defends_attacked={resolved[0]}")
-
-            if attack_info := tactical.get("attack_info"):
-                if attack_info.get("is_attacking"):
-                    if attack_info.get("attacker_piece", "piece") != move["piece"] and verified.get("gives_check"):
-                        line_parts.append("zwischenzug=true")
-                        line_parts.append(f"threatens={attack_info.get('target_piece')}")
-                    elif attack_info.get("attack_type") == "trade_offer": line_parts.append(f"offers_trade={attack_info.get('target_piece')}")
-                    elif attack_info.get("attack_type") == "favorable_trade": line_parts.append(f"attacks_valuable={attack_info.get('target_piece')}")
-                    else: line_parts.append(f"threatens={attack_info.get('target_piece')}")
-
-            if themes := tactical.get("strategic_themes", []): line_parts.append(f"strategy={themes[0]}")
-            if verified.get("gives_checkmate"): line_parts.append("mate=true")
-            
-            if missed := ctx.get("missed_tactics"):
-                if best_move := missed.get("missed_best_move"): line_parts.append(f"MISSED={best_move}")
-
+            move = ctx["move"]
+            blueprint = ctx.get("blueprint") or ctx.get("commentary_blueprint") or {}
+            draft = str(ctx.get("draft_commentary", "") or "")
+            keyword_text = ", ".join(str(item) for item in blueprint.get("keywords", []) if item) or "none"
+            line_parts = [
+                f"ply={ctx['ply']}",
+                f"move={move['mover']} {move['san']}",
+                f"draft={draft}",
+                f"lead={blueprint.get('lead', '') or '-'}",
+                f"support={blueprint.get('support', '') or '-'}",
+                f"verdict={blueprint.get('verdict', '') or '-'}",
+                f"keywords={keyword_text}",
+            ]
+            context_by_ply[int(ctx["ply"])] = ctx
             context_lines.append(" | ".join(line_parts))
 
-        prompt = f"""You are a chess grandmaster commentator. Write natural, concise commentary for each move.
+        prompt = f"""You are editing chess commentary, not analyzing the position.
+The chess understanding is already done for you. Rewrite each verified draft into polished commentary.
 
 RULES:
-1. Be CONVERSATIONAL: "White develops the knight" not "The knight is developed"
-2. If "hangs=" exists, explicitly state they blundered and hung that piece
-3. If "zwischenzug=true", call it a brilliant in-between check
-4. If "trades_for=" or "offers_trade=", mention the trade
-5. If "defends_attacked=", mention they saved the piece
-6. NEVER invent or hallucinate piece locations, defenders, or attackers that are not explicitly provided.
-7. Include at least one concrete chess idea
-8. Output ONLY valid JSON: {{"commentaries":[{{"ply":<int>,"text":"<commentary>"}}, ...]}}
+1. Rewrite only; do not add any fresh chess analysis
+2. Preserve the meaning and locked keywords for every move
+3. Do not add any new square, move, line, attacker, defender, or evaluation claim
+4. Keep each commentary at least as concrete as the draft
+5. Output ONLY valid JSON: {{"commentaries":[{{"ply":<int>,"text":"<commentary>"}}, ...]}}
 
-MOVES:
+PLANS:
 {chr(10).join(context_lines)}"""
 
         try:
@@ -928,7 +1080,9 @@ MOVES:
             if json_match := re.search(r'\{[\s\S]*\}', getattr(resp, "text", "") or ""):
                 for item in json.loads(json_match.group(0)).get("commentaries", []):
                     ply, commentary = item.get("ply"), sanitize_sentence(item.get("text", ""))
-                    if ply and commentary and not is_low_quality_commentary(commentary): by_ply[int(ply)] = commentary
+                    ctx = context_by_ply.get(int(ply)) if ply else None
+                    if ply and commentary and ctx and _rewrite_preserves_blueprint(commentary, ctx):
+                        by_ply[int(ply)] = commentary
         except Exception as exc: logger.debug("Batch Gemini generation failed: %s", exc)
 
     return by_ply
@@ -1082,6 +1236,7 @@ def handle_disconnect():
     if sid in commentary_engines:
         try: del commentary_engines[sid]
         except Exception: pass
+    _session_blueprints.pop(sid, None)
 
 @socketio.on("analyze_position")
 def handle_analysis_request(data: Dict[str, Any]):
@@ -1102,15 +1257,25 @@ def handle_commentary_request(data: Dict[str, Any]):
     settings = data.get("settings") if isinstance(data, dict) else {}
     tactics_enabled = _tactics_enabled_from_settings(settings)
     fen_before, fen_after, move_san, ply, opening_name, audio_enabled = data.get("previous_fen") or data.get("fen_before"), data.get("current_fen") or data.get("fen_after"), data.get("humanMove") or data.get("move_san", ""), data.get("ply", 0), data.get("opening", "Unknown"), bool(data.get("audio_enabled"))
+    prev_prev_fen = data.get("previous_previous_fen")
+    previous_move_san = data.get("previous_move_san", "")
 
     if not fen_after: return
     prev_board, curr_board = chess.Board(fen_before) if fen_before else None, chess.Board(fen_after)
+    prev_prev_board = chess.Board(prev_prev_fen) if prev_prev_fen else None
 
     move = None
     if prev_board and move_san:
         try: move = prev_board.parse_san(move_san)
         except ValueError: pass
     if not move and prev_board: move = _find_move_between_boards(prev_board, curr_board)
+
+    previous_move = None
+    if prev_prev_board and prev_board and previous_move_san:
+        try: previous_move = prev_prev_board.parse_san(previous_move_san)
+        except ValueError: previous_move = None
+    if not previous_move and prev_prev_board and prev_board:
+        previous_move = _find_move_between_boards(prev_prev_board, prev_board)
 
     cp_before, cp_after = get_commentary_eval(sid, fen_before) if fen_before else 0, get_commentary_eval(sid, fen_after)
     quality = classify_move_quality(cp_before, cp_after, prev_board.turn == chess.WHITE if prev_board else True)
@@ -1122,7 +1287,17 @@ def handle_commentary_request(data: Dict[str, Any]):
 
     analysis_after = _build_analysis_after(sid, prev_board, curr_board, move, tactics_enabled)
 
-    context = build_rich_context(prev_board=prev_board or curr_board, curr_board=curr_board, move=move, move_san=move_san, analysis_after=analysis_after, cp_before=cp_before, cp_after=cp_after, opening_name=opening_name, missed_tactics=missed_tactics, tactics_enabled=tactics_enabled)
+    # Guard: if we have no previous board, we cannot meaningfully describe a
+    # move (prev_board.turn would be curr_board.turn, i.e. the NEXT player,
+    # which inverts the mover name in all commentary).  Fall back to a
+    # minimal response instead of generating inverted commentary.
+    if prev_board is None:
+        socketio.emit("ai_commentary_text_result", {"commentary": "", "ply": ply, "move": move_san, "quality": quality}, room=sid)
+        return
+
+    previous_blueprint = _session_blueprints.get(sid)
+    context = build_rich_context(prev_board=prev_board, curr_board=curr_board, move=move, move_san=move_san, analysis_after=analysis_after, cp_before=cp_before, cp_after=cp_after, opening_name=opening_name, missed_tactics=missed_tactics, tactics_enabled=tactics_enabled, previous_move=previous_move, previous_blueprint=previous_blueprint, sid=sid)
+    _session_blueprints[sid] = context.get("blueprint")
 
     commentary = generate_gemini_commentary(context=context) if text_model else ""
     if not commentary: commentary = generate_fallback_commentary(context)
@@ -1160,6 +1335,8 @@ def handle_batch_commentary_request(data: Dict[str, Any]):
             return
 
         contexts, total = [], min(len(moves), len(fens) - 1)
+        previous_move = None
+        previous_blueprint = None
         socketio.emit("batch_commentary_progress", {"progress": 5, "message": f"Preparing commentary for {total} moves...", "gameKey": game_key}, room=sid)
 
         for ply in range(1, total + 1):
@@ -1178,7 +1355,24 @@ def handle_batch_commentary_request(data: Dict[str, Any]):
 
                 analysis_after = _build_analysis_after(sid, prev_board, curr_board, move, tactics_enabled)
 
-                contexts.append(build_rich_context(prev_board=prev_board, curr_board=curr_board, move=move, move_san=move_san, analysis_after=analysis_after, cp_before=cp_before, cp_after=cp_after, opening_name=opening_name, missed_tactics=missed_tactics, tactics_enabled=tactics_enabled))
+                context = build_rich_context(
+                    prev_board=prev_board,
+                    curr_board=curr_board,
+                    move=move,
+                    move_san=move_san,
+                    analysis_after=analysis_after,
+                    cp_before=cp_before,
+                    cp_after=cp_after,
+                    opening_name=opening_name,
+                    missed_tactics=missed_tactics,
+                    tactics_enabled=tactics_enabled,
+                    previous_move=previous_move,
+                    previous_blueprint=previous_blueprint,
+                    sid=sid,
+                )
+                contexts.append(context)
+                previous_move = move
+                previous_blueprint = context.get("blueprint")
 
                 if ply % 5 == 0 or ply == total: socketio.emit("batch_commentary_progress", {"progress": int(5 + (ply / total) * 50), "message": f"Prepared commentary data for {ply}/{total} moves...", "gameKey": game_key}, room=sid)
             except Exception as e:
